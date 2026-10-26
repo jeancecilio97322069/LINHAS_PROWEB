@@ -728,13 +728,17 @@ function drawEnt(e, sel){
     // seta de escoamento: marcador triangular rotacionado (ang = horario a partir do Norte)
     const p=e.pts[0]; const sx=w2sx(p[0]), sy=w2sy(p[1]);
     const ang=(e.ang||0)*Math.PI/180;
-    const s=sel?12:9;
+    const k=((e.lw||1.5)/1.5)*(L.lw||1);
+    const s=10*k*(sel?1.2:1);                 // meio comprimento da seta (px)
+    const hw=s*0.62, sw=s*0.27, hb=s*0.05;    // largura da cabeca, meia haste, base da cabeca
     ctx.save();
     ctx.translate(sx,sy); ctx.rotate(ang);
-    ctx.fillStyle=e.color||'#1565c0'; ctx.strokeStyle=sel?'#ff0':'#fff'; ctx.lineWidth=sel?1.5:0.8;
+    ctx.fillStyle=e.color||'#1e3fe0';
     ctx.beginPath();
-    ctx.moveTo(0,-s); ctx.lineTo(s*0.7,s*0.8); ctx.lineTo(0,s*0.35); ctx.lineTo(-s*0.7,s*0.8); ctx.closePath();
-    ctx.fill(); ctx.stroke();
+    ctx.moveTo(0,-s); ctx.lineTo(hw,hb); ctx.lineTo(sw,hb); ctx.lineTo(sw,s); ctx.lineTo(-sw,s); ctx.lineTo(-sw,hb); ctx.lineTo(-hw,hb); ctx.closePath();
+    ctx.fill();
+    if(sel){ ctx.strokeStyle='#ffd23f'; ctx.lineWidth=1.5; ctx.stroke(); }
+    else if(s>=6){ ctx.strokeStyle='rgba(255,255,255,.55)'; ctx.lineWidth=0.6; ctx.stroke(); }
     ctx.restore();
   } else if(e.type==='dim'){
     const p1=e.pts[0], p2=e.pts[1];
@@ -1663,6 +1667,7 @@ function updateProps(){
   if(!allSameLayer) sl.insertAdjacentHTML('afterbegin', '<option value="" selected disabled>*VARIES*</option>');
 
   if(typeof aciPropRefresh==='function') aciPropRefresh(selEnts);
+  { const _lr=document.querySelector('#prLwRow > span'); if(_lr) _lr.textContent = selEnts.every(e=>e.type==='seta') ? 'Tamanho:' : 'Espessura:'; }
   { const lws=[...new Set(selEnts.map(e=>e.lw||1.5))], inp=document.getElementById('prLw');
     if(inp){ inp.value = lws.length===1 ? lws[0] : ''; inp.placeholder = lws.length===1 ? '' : 'var'; } }
 
@@ -3452,12 +3457,40 @@ function elevWorld(wx, wy, r){
   if(r.utm){ const en=latLonToUtm(ll[0],ll[1],r.utm.zone,r.utm.south); px=en[0]; py=en[1]; }
   else { px=ll[1]; py=ll[0]; }
   const [minX,minY,maxX,maxY]=r.rasterBbox;
-  const col=Math.floor((px-minX)/((maxX-minX)||1)*r.rw);
-  const row=Math.floor((maxY-py)/((maxY-minY)||1)*r.rh);
+  const fc=(px-minX)/((maxX-minX)||1)*r.rw, fr=(maxY-py)/((maxY-minY)||1)*r.rh;
+  const col=Math.floor(fc), row=Math.floor(fr);
   if(col<0||col>=r.rw||row<0||row>=r.rh) return null;
+  const ok=v=>v!==r.nodata && isFinite(v);
   const v=r.elev[row*r.rw+col];
-  if(v===r.nodata||!isFinite(v)) return null;
+  // interpolacao bilinear entre os centros dos 4 pixels vizinhos
+  const x=fc-0.5, y=fr-0.5, c0=Math.max(0,Math.min(r.rw-2,Math.floor(x))), r0=Math.max(0,Math.min(r.rh-2,Math.floor(y)));
+  if(r.rw>1 && r.rh>1){
+    const tx=Math.max(0,Math.min(1,x-c0)), ty=Math.max(0,Math.min(1,y-r0));
+    const a=r.elev[r0*r.rw+c0], b=r.elev[r0*r.rw+c0+1], c=r.elev[(r0+1)*r.rw+c0], d=r.elev[(r0+1)*r.rw+c0+1];
+    if(ok(a)&&ok(b)&&ok(c)&&ok(d)) return (a*(1-tx)+b*tx)*(1-ty)+(c*(1-tx)+d*tx)*ty;
+  }
+  if(!ok(v)) return null;
   return v;
+}
+/* tamanho do pixel do MDT em metros */
+function mdtPixelM(r){
+  r=r||mdtAtivo(); if(!r) return 1;
+  const [minX,minY,maxX,maxY]=r.rasterBbox, k=r.utm?1:111320;
+  return Math.max((maxX-minX)/r.rw,(maxY-minY)/r.rh)*k;
+}
+/* inclinacao (m/m) ao longo da linha no ponto 'd': regressao das cotas
+   amostradas em uma janela +-W (W >= 2 pixels), sentido da linha */
+function inclinacaoAoLongo(pts, d, total, W, mdt){
+  const passo=Math.max(0.5, W/6);
+  let n=0, ss=0, sz=0, sss=0, ssz=0;
+  for(let t=Math.max(0,d-W); t<=Math.min(total,d+W)+1e-9; t+=passo){
+    const q=interpolaEm(pts,t), z=elevWorld(q[0],q[1],mdt);
+    if(z==null) continue;
+    n++; ss+=t; sz+=z; sss+=t*t; ssz+=t*z;
+  }
+  if(n<3) return null;
+  const den=n*sss-ss*ss; if(Math.abs(den)<1e-12) return null;
+  return {slope:(n*ssz-ss*sz)/den, z:sz/n};
 }
 
 /* ---------------------------------------------------------------
@@ -3539,11 +3572,17 @@ function gerarSetasEscoamento(){
   const mdt = mdtAtivo();
   if(!mdt){ log('Setas: carregue antes um MDT (GeoTIFF de altimetria).','e'); return; }
   let alvo = ents.filter(e=>selection.has(e.id) && (e.type==='line'||e.type==='pline'||e.type==='spline'||e.type==='arc'));
-  if(!alvo.length) alvo = ents.filter(e=>(e.type==='line'||e.type==='pline'||e.type==='spline'||e.type==='arc') && LB(e.layer).name!=='DECLIVIDADE');
+  if(!alvo.length) alvo = ents.filter(e=>(e.type==='line'||e.type==='pline'||e.type==='spline'||e.type==='arc') && !/^(DECLIVIDADE|FLUXO_STRAHLER|CURVAS_NIVEL|SETAS_ESCOAMENTO)/.test(LB(e.layer).name) && !e.hidden && LB(e.layer).on!==false);
   if(!alvo.length){ log('Setas: nenhuma linha encontrada.','e'); return; }
 
-  const distStr = prompt('Espacamento entre setas (m):','15');
-  const dist = parseFloat(distStr); if(!(dist>0)){ log('Setas: espacamento invalido.','e'); return; }
+  const distStr = prompt('Espacamento entre setas (m):', String(S._setaDist||15));
+  if(distStr===null) return;
+  const dist = parseFloat(String(distStr).replace(',','.')); if(!(dist>0)){ log('Setas: espacamento invalido.','e'); return; }
+  const pxm = mdtPixelM(mdt);
+  const winStr = prompt(`Janela de leitura do relevo (m) — o sentido e a inclinacao media nesse trecho ao redor de cada seta.\nMinimo recomendado: 2 pixels do MDT (${(2*pxm).toFixed(1)} m). Maior = menos sensivel a ruido.`, String(S._setaWin||Math.max(5, Math.round(2*pxm))));
+  if(winStr===null) return;
+  const W = Math.max(pxm, parseFloat(String(winStr).replace(',','.'))||2*pxm);
+  S._setaDist=dist; S._setaWin=W;
 
   pushState();
   const layId = getOrCreateLayer('SETAS_ESCOAMENTO', '#1565c0');
@@ -3552,24 +3591,26 @@ function gerarSetasEscoamento(){
   let n=0;
   for(const e of alvo){
     const pts = e.type==='spline' ? smoothCatmull(e.pts) : e.pts;
-    const amostras = pontosAoLongo(pts, dist);
+    const amostras = pontosAoLongo(pts, dist), total = compr(pts);
+    let dAcc = 0;
     for(const a of amostras){
+      const d = dAcc; dAcc += dist;
+      const inc = inclinacaoAoLongo(pts, Math.min(d,total), total, W, mdt);
+      if(!inc) continue;
       const p1=a.pTras, p2=a.pFrente;
-      const z1=elevWorld(p1[0],p1[1],mdt), z2=elevWorld(p2[0],p2[1],mdt);
-      if(z1==null||z2==null) continue;
       const dx=p2[0]-p1[0], dy=p2[1]-p1[1];
       let ang=Math.atan2(dx,dy)*180/Math.PI;   // horario a partir do Norte
       let flux;
-      if(z1>=z2){ flux='DIRETO'; } else { ang+=180; flux='INVERSO'; }
+      if(inc.slope<=0){ flux='DIRETO'; } else { ang+=180; flux='INVERSO'; }
       ang=((ang%360)+360)%360;
-      commit({ type:'seta', pts:[[a.p[0],a.p[1]]], layer:layId,
-               color: flux==='DIRETO'?'#1565c0':'#d32f2f',
-               ang, meta:{fluxo:flux, altitude:+((z1+z2)/2).toFixed(2)} });
+      ents.push({ id:newId(), type:'seta', pts:[[a.p[0],a.p[1]]], layer:layId,
+               color: flux==='DIRETO'?'#1e3fe0':'#d62828',
+               ang, meta:{fluxo:flux, altitude:+inc.z.toFixed(2), decl_pct:+(Math.abs(inc.slope)*100).toFixed(2)} });
       n++;
     }
   }
   renderLayers();
-  log(`Setas de escoamento: ${n} seta(s) geradas (azul=direto, vermelho=inverso).`,'g');
+  log(`Setas de escoamento: ${n} seta(s) geradas (azul=direto, vermelho=inverso) — janela de ${W.toFixed(1)} m, MDT ${pxm.toFixed(2)} m/pixel.`,'g');
   renderLayers();
   S.dirty=true;
 }
