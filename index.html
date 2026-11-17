@@ -2200,6 +2200,7 @@ function showCanvasMenu(x,y){
     {label:'Enquadrar (ZE)', fn:zoomExtents},
     'sep',
     {label:'💾 Salvar no navegador agora', fn:autosaveNow},
+    {label:'🕑 Pontos de restauração…', fn:safeRestoreDialog},
     {label:'🧹 Limpar projeto salvo (autosave)', fn:limparAutosave},
     'sep',
     {label:'⚙ Configurações (cursor/seleção)', fn:()=>{ const cp=document.getElementById('cfgPanel'); if(cp) cp.style.display='flex'; }}
@@ -11474,6 +11475,177 @@ function pltDialogo(){
 ['PLOT','IMPRIMIR','LAYOUT','COMPOSITOR','IMPRESSAO'].forEach(a=>ALIASES[a]='PLOT');
 if(typeof CMD_DESC!=='undefined') CMD_DESC.PLOT='Compositor de impressão (folha, escala, legenda, carimbo)';
 { const _stP=startTool; startTool=function(c){ if(c==='PLOT'){ try{ LAST_CMD=c; }catch(_){} tool.reset(); pltDialogo(); return; } return _stP(c); }; }
+
+
+
+/* =====================================================================
+   PROTEÇÃO DE DADOS (web)  — Linhas Pro
+   1) Pontos de restauração rotativos (histórico do DESENHO, à prova de
+      sobrescrita do autosave único).
+   2) Aviso de alterações não salvas ao fechar + storage.persist().
+   3) Rasters (MDT/orto) incluídos na persistência (reaparecem no reload).
+   4) Tratamento de cota (QuotaExceeded) com aviso na tela.
+   Tudo em chaves próprias no IndexedDB; não altera o autosave existente.
+   ===================================================================== */
+const SAFE = {
+  pending:false, quotaWarned:false,
+  RP_KEY:'safe_restore', RAST_KEY:'safe_rasters',
+  RP_MAX:12, RP_EVERY:150000,      // ponto de restauração a cada 2,5 min (se mudou)
+  RAST_EVERY:30000,                 // rasters no máx. a cada 30 s
+  _lastRP:0, _lastRPsig:'', _lastRast:0, _rastSig:'', _pngCache:new Map()
+};
+
+/* ---- storage.persist(): pede ao navegador pra não despejar os dados ---- */
+(async()=>{ try{ if(navigator.storage && navigator.storage.persist){
+  const já=await navigator.storage.persisted?.(); if(!já) await navigator.storage.persist();
+} }catch(_){ } })();
+
+/* ---- detecta falta de espaço nos writes do IndexedDB e avisa 1x ---- */
+function _safeQuota(e){
+  const nome=(e && (e.name||e.target&&e.target.error&&e.target.error.name))||'';
+  if(/quota/i.test(nome) || /quota/i.test(String(e&&e.message))){
+    if(!SAFE.quotaWarned){ SAFE.quotaWarned=true;
+      try{ log('ARMAZENAMENTO CHEIO: o navegador não deixou salvar. Salve o projeto em arquivo (Ctrl+S) e limpe projetos antigos.','e'); }catch(_){}
+      try{ safeToast('⚠ Sem espaço pra salvar no navegador — salve em arquivo (Ctrl+S).'); }catch(_){}
+    }
+    return true;
+  }
+  return false;
+}
+/* put/get/del próprios (mesma base _DB/_STORE do app) com captura de cota */
+function _safePut(k,v){ return _idbPut(k,v).catch(e=>{ _safeQuota(e); throw e; }); }
+function _safeGet(k){ try{ return _idbGet(k); }catch(e){ return Promise.resolve(null); } }
+
+/* ===== 1) PONTOS DE RESTAURAÇÃO (desenho, sem raster) ===== */
+function _safeDrawSnap(){ try{ const s=snapshotProject(); return {savedAt:new Date().toISOString(), nEnts:(ents?ents.length:0),
+  doc:(typeof docActive==='function'&&docActive()?docActive().name:'Desenho'), snap:s}; }catch(_){ return null; } }
+function _safeSig(s){ return s? (s.nEnts+'|'+(s.snap&&s.snap.ents?s.snap.ents.length:0)+'|'+(s.snap&&s.snap.layers?s.snap.layers.length:0)) : ''; }
+async function _safeRP(force){
+  const now=Date.now(); if(!force && now-SAFE._lastRP<SAFE.RP_EVERY) return;
+  const pt=_safeDrawSnap(); if(!pt || !pt.nEnts) return;         // não cria ponto de desenho vazio
+  const sig=_safeSig(pt); if(!force && sig===SAFE._lastRPsig) return;
+  SAFE._lastRP=now; SAFE._lastRPsig=sig;
+  try{
+    const cur=(await _safeGet(SAFE.RP_KEY))||{points:[]};
+    cur.points.push(pt); while(cur.points.length>SAFE.RP_MAX) cur.points.shift();
+    await _safePut(SAFE.RP_KEY,cur);
+  }catch(_){}
+}
+async function safeRestoreDialog(){
+  let cur; try{ cur=(await _safeGet(SAFE.RP_KEY))||{points:[]}; }catch(_){ cur={points:[]}; }
+  const pts=(cur.points||[]).slice().reverse();
+  const box=document.getElementById('modalbox'); if(box) box.style.width='460px';
+  const linhas = pts.length ? pts.map((p,i)=>{
+    const d=new Date(p.savedAt), hh=d.toLocaleString('pt-BR');
+    return `<div class="srp" data-i="${i}" style="display:flex;gap:8px;align-items:center;justify-content:space-between;padding:6px 8px;border:1px solid var(--line);border-radius:4px;margin-top:4px">
+      <div><b style="font-family:var(--mono)">${hh}</b><br><span style="font-size:10.5px;color:var(--ink-dim)">${_safeEsc(p.doc)} · ${p.nEnts} objeto(s)</span></div>
+      <button class="ok srp-go" data-i="${i}" style="padding:3px 10px">Restaurar</button></div>`;
+  }).join('') : '<div style="font-size:11px;color:var(--ink-dim);margin-top:6px">Ainda não há pontos de restauração. Eles são criados sozinhos enquanto você desenha.</div>';
+  modalHTML(`<h3>Pontos de restauração</h3>
+    <div style="font-size:10.5px;color:var(--ink-dim)">Cópias automáticas do desenho guardadas no navegador. Restaurar abre em um <b>novo desenho</b>, sem mexer no atual.</div>
+    <div style="max-height:52vh;overflow:auto;margin-top:6px">${linhas}</div>
+    <div class="row"><button class="cancel" id="srpX">Fechar</button><button class="cancel" id="srpNow">Criar ponto agora</button></div>`);
+  const $=id=>document.getElementById(id);
+  $('srpX').onclick=()=>{ if(box) box.style.width=''; closeModal(); };
+  $('srpNow').onclick=async()=>{ await _safeRP(true); safeRestoreDialog(); };
+  document.querySelectorAll('.srp-go').forEach(b=>b.onclick=()=>{ const p=pts[+b.dataset.i]; if(!p) return; safeAbrirPonto(p); if(box) box.style.width=''; closeModal(); });
+}
+function safeAbrirPonto(p){
+  try{
+    const nome=(p.doc||'Restaurado')+' ('+new Date(p.savedAt).toLocaleString('pt-BR')+')';
+    if(typeof docNew==='function'){ docNew(nome.slice(0,40),true); }
+    applyProject(p.snap);
+    if(typeof docMarkDirty==='function') docMarkDirty();
+    log('Ponto de restauração carregado em um novo desenho: '+p.nEnts+' objeto(s). O desenho anterior continua intacto.','g');
+    try{ zoomExtents(); }catch(_){}
+  }catch(e){ log('Não consegui restaurar esse ponto: '+(e.message||e),'e'); }
+}
+function _safeEsc(s){ return String(s==null?'':s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+
+/* ===== 3) RASTERS na persistência ===== */
+function _safeRastSig(){ try{ return (rasters||[]).map(r=>r.id+':'+(r.bmp?(r.rw+'x'+r.rh):'0')+':'+(r.on?1:0)+':'+(r.opacity||0)).join(','); }catch(_){ return ''; } }
+function _cv2blob(cv){ return new Promise(res=>{ try{ if(cv.convertToBlob) return cv.convertToBlob({type:'image/png'}).then(res,()=>res(null));
+  if(cv.toBlob) return cv.toBlob(res,'image/png'); res(null); }catch(_){ res(null); } }); }
+async function _safeSerializeRasters(){
+  const out=[]; const vivos=new Set();
+  for(const r of (rasters||[])){
+    vivos.add(r.id);
+    const base={ id:r.id, nome:r.nome, tipo:r.tipo, cantos:r.cantos, bboxLL:r.bboxLL, epsg:r.epsg, utm:r.utm,
+      rasterBbox:r.rasterBbox, rw:r.rw, rh:r.rh, nodata:r.nodata, on:r.on, opacity:r.opacity };
+    if(r.tipo==='mdt' && r.elev){ base.elev=r.elev; }     // MDT: guarda elevação, reconstrói a imagem no load
+    else {                                                 // orto/mdt sem elev: guarda o PNG da imagem (cacheado por bmp)
+      const cache=SAFE._pngCache.get(r.id);
+      if(cache && cache.ref===r.bmp){ base.png=cache.blob; }
+      else if(r.bmp){ const blob=await _cv2blob(r.bmp); if(blob){ SAFE._pngCache.set(r.id,{ref:r.bmp,blob}); base.png=blob; } }
+    }
+    out.push(base);
+  }
+  for(const k of [...SAFE._pngCache.keys()]) if(!vivos.has(k)) SAFE._pngCache.delete(k);
+  return out;
+}
+async function _safeRasters(force){
+  const now=Date.now(); if(!force && now-SAFE._lastRast<SAFE.RAST_EVERY) return;
+  const sig=_safeRastSig(); if(!force && sig===SAFE._rastSig) return;
+  SAFE._lastRast=now; SAFE._rastSig=sig;
+  try{
+    if(!rasters || !rasters.length){ await _idbDel(SAFE.RAST_KEY).catch(()=>{}); return; }
+    const items=await _safeSerializeRasters();
+    await _safePut(SAFE.RAST_KEY,{ georef:{lat0:S.lat0,lon0:S.lon0}, savedAt:new Date().toISOString(),
+      doc:(typeof docActive==='function'&&docActive()?docActive().name:''), items });
+  }catch(_){}
+}
+async function safeRehydrateRasters(){
+  try{
+    if(typeof rasters==='undefined') return;
+    if(rasters && rasters.length) return;                 // doc atual já tem rasters
+    const cache=await _safeGet(SAFE.RAST_KEY); if(!cache || !cache.items || !cache.items.length) return;
+    // só reidrata se for a mesma área do projeto atual (evita misturar com outro desenho)
+    const g=cache.georef; if(g && (Math.abs(g.lat0-S.lat0)>0.02 || Math.abs(g.lon0-S.lon0)>0.02)) return;
+    let maxId=0;
+    for(const b of cache.items){
+      let bmp=null;
+      if(b.tipo==='mdt' && b.elev){ bmp=mdtParaImagem(b.elev,b.rw,b.rh,b.nodata); }
+      else if(b.png){ try{ bmp=await createImageBitmap(b.png); }catch(_){ bmp=null; } }
+      const r=Object.assign({},b,{bmp}); rasters.push(r); maxId=Math.max(maxId,b.id||0);
+    }
+    if(typeof ridc!=='undefined' && maxId>=ridc) ridc=maxId+1;
+    if(typeof docActive==='function'&&docActive()) docActive().rasters=rasters;
+    if(typeof renderRasterPanel==='function') renderRasterPanel();
+    S.dirty=true;
+    log(cache.items.length+' raster(s) (MDT/orto) restaurado(s) do navegador.','g');
+  }catch(e){ console.error('rehydrate rasters',e); }
+}
+
+/* ===== 2) PENDÊNCIA + AVISO AO FECHAR ===== */
+{ const _ps=pushState; pushState=function(){ const r=_ps.apply(this,arguments); SAFE.pending=true; return r; }; }
+{ const _an=autosaveNow; autosaveNow=async function(){           // envolve o autosave já existente (CAD+docs)
+    try{ const r=await _an.apply(this,arguments); SAFE.pending=false; return r; }
+    catch(e){ _safeQuota(e); throw e; }
+  }; }
+window.addEventListener('beforeunload', e=>{ if(SAFE.pending){ e.preventDefault(); e.returnValue=''; return ''; } });
+
+/* ===== disparos periódicos (além do autosave de 15 s do app) ===== */
+setInterval(()=>{ _safeRP(false); _safeRasters(false); }, 20000);
+document.addEventListener('visibilitychange', ()=>{ if(document.hidden){ _safeRP(true); _safeRasters(true); } });
+window.addEventListener('pagehide', ()=>{ try{ _safeRP(true); _safeRasters(true); }catch(_){} });
+
+/* reidrata rasters depois que as abas forem restauradas no load */
+setTimeout(safeRehydrateRasters, 700);
+setTimeout(()=>{ _safeRP(false); }, 4000);
+
+/* toast simples (sem depender de nada do app) */
+function safeToast(msg){
+  let t=document.getElementById('safeToast');
+  if(!t){ t=document.createElement('div'); t.id='safeToast';
+    t.style.cssText='position:fixed;left:50%;bottom:54px;transform:translateX(-50%);background:#2a2d31;color:#fff;border:1px solid #555;border-radius:6px;padding:9px 14px;font:12px system-ui,sans-serif;z-index:99999;box-shadow:0 4px 18px rgba(0,0,0,.5);max-width:92vw;text-align:center';
+    document.body.appendChild(t); }
+  t.textContent=msg; t.style.display='block'; clearTimeout(t._h); t._h=setTimeout(()=>{ t.style.display='none'; },6000);
+}
+
+/* comando RESTAURAR / PONTOS abre o diálogo */
+['RESTAURAR','PONTOS','RECUPERAR','BACKUP'].forEach(a=>{ try{ ALIASES[a]='RESTAURAR'; }catch(_){} });
+if(typeof CMD_DESC!=='undefined') CMD_DESC.RESTAURAR='Pontos de restauração (histórico do desenho no navegador)';
+{ const _st=startTool; startTool=function(c){ if(c==='RESTAURAR'){ try{ LAST_CMD=c; }catch(_){} if(typeof tool!=='undefined') tool.reset(); safeRestoreDialog(); return; } return _st.apply(this,arguments); }; }
 
 </script>
 </body>
