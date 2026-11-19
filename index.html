@@ -2202,6 +2202,7 @@ function showCanvasMenu(x,y){
     {label:'💾 Salvar no navegador agora', fn:autosaveNow},
     {label:'🕑 Pontos de restauração…', fn:safeRestoreDialog},
     {label:'☁ Nuvem (salvar/abrir online)…', fn:cloudDialog},
+    {label:'🔑 Licença (trocar / sair)…', fn:lpTrocarLicenca},
     {label:'🧹 Limpar projeto salvo (autosave)', fn:limparAutosave},
     'sep',
     {label:'⚙ Configurações (cursor/seleção)', fn:()=>{ const cp=document.getElementById('cfgPanel'); if(cp) cp.style.display='flex'; }}
@@ -11795,6 +11796,107 @@ function cloudDialog() {
 ['NUVEM', 'CLOUD', 'ONLINE', 'SYNC'].forEach(a => { try { ALIASES[a] = 'NUVEM'; } catch (_) {} });
 if (typeof CMD_DESC !== 'undefined') CMD_DESC.NUVEM = 'Nuvem — salvar/abrir projetos online (chave de licença)';
 { const _st = startTool; startTool = function (c) { if (c === 'NUVEM') { try { LAST_CMD = c; } catch (_) {} if (typeof tool !== 'undefined') tool.reset(); cloudDialog(); return; } return _st.apply(this, arguments); }; }
+
+
+
+/* =====================================================================
+   TELA DE LICENÇA (gate) — o app só abre com chave válida.
+   Usa o mesmo servidor da Nuvem (/api/login). Uma chave libera app + nuvem.
+   Offline-first: valida online 1x e funciona por LPGATE.GRACE_DAYS dias sem
+   internet antes de pedir revalidação. A chave também tem validade própria
+   (exp): o que vier primeiro manda.
+   ===================================================================== */
+const LPGATE = {
+  GRACE_DAYS: 21,
+  KEY: 'lp_lic',
+  DEFAULT_BASE: 'https://linhaspro-cloud.jeancinti.workers.dev', // << seu Worker
+};
+// endereço do servidor embutido (cliente não precisa digitar)
+if (!CLOUD.base) { CLOUD.base = LPGATE.DEFAULT_BASE; try { localStorage.setItem('lp_cloud_base', CLOUD.base); } catch (_) {} }
+
+function _lpRead() { try { return JSON.parse(localStorage.getItem(LPGATE.KEY) || 'null'); } catch (_) { return null; } }
+function _lpSave(l) { try { localStorage.setItem(LPGATE.KEY, JSON.stringify(l)); } catch (_) {} }
+function _lpClear() { try { localStorage.removeItem(LPGATE.KEY); } catch (_) {} }
+function _lpPersist() {
+  const now = Date.now(), expMs = CLOUD.exp ? CLOUD.exp * 1000 : null;
+  let graceUntil = now + LPGATE.GRACE_DAYS * 86400000;
+  if (expMs) graceUntil = Math.min(graceUntil, expMs);
+  _lpSave({ key: CLOUD.key, name: CLOUD.name, exp: CLOUD.exp || null, validatedAt: now, graceUntil });
+}
+function _lpReason(r) {
+  if (r === 'expirada') return 'Licença expirada. Fale com o fornecedor pra renovar.';
+  if (r === 'assinatura' || r === 'formato' || r === 'invalida' || r === 'sem_sub') return 'Chave inválida. Confira se copiou a chave inteira.';
+  if (r === 'sem_internet') return 'Sem internet — conecte uma vez para validar a chave.';
+  return 'Não foi possível validar: ' + (r || 'erro');
+}
+
+function _lpOverlay() {
+  let el = document.getElementById('lp-gate'); if (el) return el;
+  el = document.createElement('div'); el.id = 'lp-gate';
+  el.style.cssText = 'position:fixed;inset:0;z-index:2147483600;background:#0f1113;display:flex;align-items:center;justify-content:center;font-family:system-ui,"Segoe UI",sans-serif';
+  el.innerHTML = `<div style="width:370px;max-width:92vw;background:#17191c;border:1px solid #2a2d31;border-radius:10px;padding:24px;box-shadow:0 12px 44px rgba(0,0,0,.6)">
+    <div style="font-size:21px;font-weight:700;color:#fff;letter-spacing:.2px">Linhas Pro</div>
+    <div style="font-size:11px;color:#8a9099;margin-bottom:16px">Projeto de linhas · Monitores de piloto automático</div>
+    <div id="lp-g-msg" style="font-size:11.5px;margin:6px 0 8px;min-height:16px;color:#ffd0c6"></div>
+    <input id="lp-g-key" type="text" autocomplete="off" spellcheck="false" placeholder="Cole sua chave de licença" style="width:100%;padding:10px;border-radius:6px;border:1px solid #333;background:#0f1113;color:#fff;font-size:12px;box-sizing:border-box">
+    <button id="lp-g-go" style="width:100%;margin-top:10px;padding:11px;border:0;border-radius:6px;background:#2d7dd2;color:#fff;font-size:13px;font-weight:600;cursor:pointer">Entrar</button>
+    <div style="font-size:10px;color:#6b7178;margin-top:14px;line-height:1.5">Não tem uma chave? Fale com o fornecedor para adquirir o acesso.
+      <span id="lp-g-srvtog" style="color:#5a6670;cursor:pointer;float:right">servidor</span></div>
+    <div id="lp-g-srvbox" style="display:none;margin-top:6px"><input id="lp-g-srv" type="text" value="${(CLOUD.base || '').replace(/"/g, '&quot;')}" style="width:100%;padding:7px;border-radius:5px;border:1px solid #333;background:#0f1113;color:#aaa;font-size:11px;box-sizing:border-box"></div>
+  </div>`;
+  document.body.appendChild(el);
+  const $ = id => document.getElementById(id);
+  const msg = t => { $('lp-g-msg').textContent = t || ''; };
+  $('lp-g-srvtog').onclick = () => { const b = $('lp-g-srvbox'); b.style.display = b.style.display === 'none' ? 'block' : 'none'; };
+  async function tentar() {
+    const k = $('lp-g-key').value.trim(); if (!k) { msg('Cole a chave de licença.'); return; }
+    const srv = $('lp-g-srv').value.trim(); if (srv) { CLOUD.base = srv; try { localStorage.setItem('lp_cloud_base', srv); } catch (_) {} }
+    msg('Validando…'); $('lp-g-go').disabled = true;
+    try {
+      const r = await cloudLogin(k);
+      if (r.ok) { _lpPersist(); lpGateUnlock(); }
+      else { msg(_lpReason(r.reason)); $('lp-g-go').disabled = false; }
+    } catch (e) { msg(_lpReason(String(e && e.message) === 'sem_internet' ? 'sem_internet' : '')); $('lp-g-go').disabled = false; }
+  }
+  $('lp-g-go').onclick = tentar;
+  $('lp-g-key').addEventListener('keydown', e => { if (e.key === 'Enter') tentar(); });
+  return el;
+}
+function lpGateShow(msg) { const el = _lpOverlay(); el.style.display = 'flex'; const m = document.getElementById('lp-g-msg'); if (m && msg) m.textContent = msg; setTimeout(() => { const k = document.getElementById('lp-g-key'); if (k) k.focus(); }, 60); }
+function lpGateUnlock() { const el = document.getElementById('lp-gate'); if (el) el.remove(); document.body.classList.add('lp-licenciado'); }
+
+async function _lpRevalidaSilencioso(lic) {
+  // se já passou de metade do prazo offline e tem internet, estende sem incomodar
+  try { const now = Date.now(); if (lic && lic.validatedAt && now - lic.validatedAt > LPGATE.GRACE_DAYS * 86400000 / 2) { const r = await cloudLogin(lic.key); if (r.ok) _lpPersist(); } } catch (_) {}
+}
+
+async function lpGateInit() {
+  const lic = _lpRead(), now = Date.now();
+  if (lic && lic.key) {
+    CLOUD.key = lic.key; CLOUD.name = lic.name; CLOUD.exp = lic.exp; // login único: libera a nuvem junto
+    if (lic.exp && now > lic.exp * 1000) { lpGateShow(_lpReason('expirada')); return; }
+    if (now < (lic.graceUntil || 0)) { lpGateUnlock(); _lpRevalidaSilencioso(lic); return; }
+    // prazo offline acabou → precisa revalidar online
+    try { const r = await cloudLogin(lic.key); if (r.ok) { _lpPersist(); lpGateUnlock(); } else { lpGateShow(_lpReason(r.reason)); } }
+    catch (e) { lpGateShow('Conecte à internet uma vez para revalidar sua licença.'); }
+    return;
+  }
+  lpGateShow(''); // primeira vez
+}
+
+/* trocar/sair da licença (menu + comando) */
+function lpTrocarLicenca() {
+  if (!confirm('Sair da licença? O app vai pedir a chave de novo. (Seus desenhos continuam salvos aqui.)')) return;
+  _lpClear(); CLOUD.key = ''; CLOUD.name = ''; CLOUD.exp = null; try { localStorage.removeItem('lp_cloud_key'); } catch (_) {}
+  if (typeof closeModal === 'function') closeModal();
+  lpGateShow('');
+}
+['LICENCA', 'LICENÇA', 'SAIR', 'TROCARLICENCA'].forEach(a => { try { ALIASES[a] = 'LICENCA'; } catch (_) {} });
+if (typeof CMD_DESC !== 'undefined') CMD_DESC.LICENCA = 'Licença — trocar chave / sair';
+{ const _st = startTool; startTool = function (c) { if (c === 'LICENCA') { try { LAST_CMD = c; } catch (_) {} if (typeof tool !== 'undefined') tool.reset(); lpTrocarLicenca(); return; } return _st.apply(this, arguments); }; }
+
+/* dispara o gate assim que a página carrega */
+if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', lpGateInit); else lpGateInit();
 
 </script>
 </body>
