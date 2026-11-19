@@ -2201,6 +2201,7 @@ function showCanvasMenu(x,y){
     'sep',
     {label:'💾 Salvar no navegador agora', fn:autosaveNow},
     {label:'🕑 Pontos de restauração…', fn:safeRestoreDialog},
+    {label:'🗺 Exportar mapa HTML…', fn:mxDialog},
     {label:'☁ Nuvem (salvar/abrir online)…', fn:cloudDialog},
     {label:'🔑 Licença (trocar / sair)…', fn:lpTrocarLicenca},
     {label:'🧹 Limpar projeto salvo (autosave)', fn:limparAutosave},
@@ -2415,7 +2416,58 @@ function commitBoxSelection(box){
   updateProps();
 }
 function doErase(){ if(selection.size){ pushState(); ents=ents.filter(e=>!selection.has(e.id)); selection.clear(); updateProps(); renderLayers(); S.dirty=true; }}
-function doSmooth(){ pushState(); ents.filter(e=>selection.has(e.id)&&e.pts).forEach(e=>e.pts=smoothCatmull(e.pts)); S.dirty=true; log('Suavização aplicada.','g'); }
+function _suavResample(P,d){ if(P.length<2||!(d>0)) return P.slice(); const out=[P[0].slice()]; let acc=0;
+  for(let i=1;i<P.length;i++){ let ax=P[i-1][0],ay=P[i-1][1]; const bx=P[i][0],by=P[i][1]; let seg=Math.hypot(bx-ax,by-ay);
+    while(seg>1e-9 && acc+seg>=d){ const t=(d-acc)/seg, nx=ax+(bx-ax)*t, ny=ay+(by-ay)*t; out.push([nx,ny]); ax=nx; ay=ny; seg=Math.hypot(bx-ax,by-ay); acc=0; }
+    acc+=seg; }
+  const L=P[P.length-1]; if(Math.hypot(out[out.length-1][0]-L[0],out[out.length-1][1]-L[1])>1e-6) out.push(L.slice()); return out; }
+function suavizarLinha(pts, minAngleDeg, spacing){
+  let P=pts.map(p=>[p[0],p[1]]);
+  const closed = P.length>2 && Math.hypot(P[0][0]-P[P.length-1][0],P[0][1]-P[P.length-1][1])<1e-6;
+  if(closed) P.pop();
+  if(P.length<3){ return _suavResample(P.concat(closed?[P[0]]:[]), spacing); }
+  const cosThr=Math.cos(Math.PI*minAngleDeg/180);   // angulo incluso mais fechado permitido
+  for(let pass=0; pass<16; pass++){
+    const n=P.length, Q=[]; let changed=false;
+    if(!closed) Q.push(P[0]);
+    for(let i=(closed?0:1); i<(closed?n:n-1); i++){
+      const a=P[(i-1+n)%n], b=P[i], c=P[(i+1)%n];
+      const v1=[a[0]-b[0],a[1]-b[1]], v2=[c[0]-b[0],c[1]-b[1]], l1=Math.hypot(v1[0],v1[1])||1e-9, l2=Math.hypot(v2[0],v2[1])||1e-9;
+      const cosA=(v1[0]*v2[0]+v1[1]*v2[1])/(l1*l2);  // cos do angulo incluso; mais fechado => cosA maior
+      if(cosA > cosThr){ Q.push([b[0]+(a[0]-b[0])*0.25,b[1]+(a[1]-b[1])*0.25]); Q.push([b[0]+(c[0]-b[0])*0.25,b[1]+(c[1]-b[1])*0.25]); changed=true; }
+      else Q.push(b);
+    }
+    if(!closed) Q.push(P[n-1]);
+    P=Q; if(!changed) break;
+  }
+  if(closed) P.push(P[0]);
+  return _suavResample(P, spacing);
+}
+const SUAV={ ang:115, dist:5, manter:false };
+try{ Object.assign(SUAV, JSON.parse(localStorage.getItem('linhaspro_suav')||'{}')); }catch(_){}
+function doSmooth(){
+  const alvo=ents.filter(e=>selection.has(e.id)&&e.pts&&e.pts.length>=2&&['pline','line','spline'].includes(e.type));
+  if(!alvo.length){ log('Suavizar: selecione uma ou mais linhas primeiro.','e'); return; }
+  modalHTML(`<h3>Suavizar linha</h3>
+    <div style="font-size:10.5px;color:var(--ink-dim)">Gera uma curva lisa e com pontos bem distribuídos a partir dos vértices, como no AgroCAD. ${alvo.length} linha(s) selecionada(s).</div>
+    <label>Ângulo incluso mais fechado permitido (°)<input type="number" id="sv_ang" min="30" max="179" step="1" value="${SUAV.ang}"></label>
+    <div style="font-size:9.5px;color:var(--ink-dim)">Cantos mais fechados que isso são arredondados; curvas mais abertas que isso são mantidas.</div>
+    <label>Distância máxima entre pontos (m)<input type="number" id="sv_dist" min="0.2" step="0.5" value="${SUAV.dist}"></label>
+    <label style="display:flex;gap:6px;align-items:center;margin-top:8px"><input type="checkbox" id="sv_keep" style="width:auto" ${SUAV.manter?'checked':''}> Manter a linha original (cria a suavizada como cópia)</label>
+    <div class="row"><button class="cancel" id="sv_x">Cancelar</button><button class="ok" id="sv_ok">Suavizar</button></div>`);
+  const $=id=>document.getElementById(id);
+  $('sv_x').onclick=closeModal;
+  $('sv_ok').onclick=()=>{
+    const ang=Math.max(30,Math.min(179,+$('sv_ang').value||115)), dist=Math.max(0.2,+$('sv_dist').value||5), keep=$('sv_keep').checked;
+    SUAV.ang=ang; SUAV.dist=dist; SUAV.manter=keep; try{ localStorage.setItem('linhaspro_suav',JSON.stringify(SUAV)); }catch(_){}
+    closeModal(); pushState(); let n=0,vin=0,vout=0;
+    for(const e of alvo){ const src=e.type==='spline'?smoothCatmull(e.pts):e.pts; const novo=suavizarLinha(src,ang,dist); vin+=e.pts.length; vout+=novo.length; n++;
+      if(keep){ const c=Object.assign({},e,{id:newId(),type:'pline',pts:novo}); delete c.sel; ents.push(c); }
+      else { e.type='pline'; e.pts=novo; } }
+    S.dirty=true; log(`Suavizar: ${n} linha(s), ${vin} → ${vout} vértices (ângulo ${ang}°, ${String(dist).replace('.',',')} m${keep?', originais mantidas':''}).`,'g');
+  };
+}
+function _doSmoothLog(){ log('Suavização aplicada.','g'); }
 function doClose(){ pushState(); ents.filter(e=>selection.has(e.id)&&e.pts).forEach(e=>e.closed=true); updateProps(); S.dirty=true; log('Polígono fechado.','g'); }
 
 function doJoin(){
@@ -2555,6 +2607,7 @@ function offsetPolyline(pts,d){
   }
   return o;
 }
+function _smoothNope(){}
 function smoothCatmull(pts){
   if(pts.length<3) return pts;
   const o=[];
@@ -7875,9 +7928,10 @@ function docSwitch(i){
   _docStash(docActive()); DOCS.cur=i; _docLoad(docActive()); docRender();
   log('Desenho ativo: '+docActive().name,'p'); _docSave();
 }
+function _docNextName(){ let mx=0; for(const d of DOCS.list){ const m=/^Desenho\s*(\d+)$/.exec((d&&d.name)||''); if(m) mx=Math.max(mx,+m[1]); } return 'Desenho'+(mx+1); }
 function docNew(name, silent){
   if(DOCS.list.length) _docStash(docActive());
-  const d={name:name||('Desenho'+(DOCS.seq++)), dirty:false, snap:null};
+  const d={name:name||_docNextName(), dirty:false, snap:null};
   DOCS.list.push(d); DOCS.cur=DOCS.list.length-1;
   _docLoad(d);
   if(!silent) log('Novo desenho: '+d.name,'g');
@@ -7886,7 +7940,7 @@ function docNew(name, silent){
 function docClose(i){
   const d=DOCS.list[i]; if(!d) return;
   const doIt=()=>{
-    if(DOCS.list.length===1){ d.snap=null; d.undo=[]; d.redo=[]; d.sel=[]; d.rasters=[]; d.dirty=false; d.name='Desenho'+(DOCS.seq++); _docLoad(d); docRender(); _docSave(); return; }
+    if(DOCS.list.length===1){ d.snap=null; d.undo=[]; d.redo=[]; d.sel=[]; d.rasters=[]; d.dirty=false; d.name='Desenho1'; _docLoad(d); docRender(); _docSave(); return; }
     const wasCur=(i===DOCS.cur);
     DOCS.list.splice(i,1);
     if(wasCur){ DOCS.cur=Math.max(0,i-1); _docLoad(docActive()); }
@@ -11897,6 +11951,160 @@ if (typeof CMD_DESC !== 'undefined') CMD_DESC.LICENCA = 'Licença — trocar cha
 
 /* dispara o gate assim que a página carrega */
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', lpGateInit); else lpGateInit();
+
+
+
+/* =====================================================================
+   EXPORTAR MAPA HTML  (comando EXPMAPA / MAPAHTML)
+   Gera um HTML autônomo (Leaflet) do projeto, no estilo do visualizador
+   QGIS do Jean: fundo Google Satellite, camadas com checkbox, legenda,
+   GPS, barra de escala. Só o desenho (vetores) — igual ao "Mapa de projeto".
+   ===================================================================== */
+function _mxEsc(s){ return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function _mxVisiveis(){ return ents.filter(e=>!e.hidden && e.pts && e.pts.length>=2 && (()=>{ const L=LB(e.layer); return !L||L.on; })()); }
+
+/* agrupa as entidades visíveis em camadas {nome,cor,tipo,feats,labels} */
+function _mxCamadas(opts){
+  const cftOn = S.cftView && typeof cftColor==='function';
+  const grupos=new Map(); // chave -> {nome,cor,linhas:[],areas:[],rotulos:[]}
+  const add=(chave,nome,cor,e)=>{
+    if(!grupos.has(chave)) grupos.set(chave,{nome,cor,linhas:[],areas:[],rotulos:[]});
+    const g=grupos.get(chave);
+    let pts=e.pts.map(p=>{ const ll=toLatLon(p[0],p[1]); return [+ll[0].toFixed(7),+ll[1].toFixed(7)]; });
+    const fechada = e.closed || (pts.length>3 && Math.abs(pts[0][0]-pts[pts.length-1][0])<1e-7 && Math.abs(pts[0][1]-pts[pts.length-1][1])<1e-7);
+    if(fechada) g.areas.push(pts); else g.linhas.push(pts);
+    return {g,pts,fechada};
+  };
+  let numLinha=new Map();
+  for(const e of _mxVisiveis()){
+    let chave,nome,cor;
+    if(cftOn && e.cft){ chave='cft:'+e.cft.c+'|'+e.cft.f+'|'+e.cft.t; nome=[e.cft.c,e.cft.f,e.cft.t].filter(Boolean).join(' · '); cor=cftColor(e.cft); }
+    else { const L=LB(e.layer); chave='L'+(L?L.id:'0'); nome=L?String(L.name).replace(/_/g,' '):'Camada'; cor=e.color||(L&&L.color)||'#2e7d46'; }
+    const {g,pts,fechada}=add(chave,nome,cor,e);
+    if(opts.rotulos){
+      if(opts.rotulos==='talhao' && e.cft && e.cft.t && fechada){ const c=_mxCentro(pts); if(c) g.rotulos.push({p:c,txt:e.cft.t}); }
+      if(opts.rotulos==='num' && !fechada){ const k=chave; const n=(numLinha.get(k)||0)+1; numLinha.set(k,n); const mid=pts[Math.floor(pts.length/2)]; if(mid) g.rotulos.push({p:mid,txt:String(n)}); }
+    }
+  }
+  return [...grupos.values()].filter(g=>g.linhas.length||g.areas.length);
+}
+function _mxCentro(ring){ let a=0,cx=0,cy=0; for(let i=0,j=ring.length-1;i<ring.length;j=i++){ const f=ring[j][1]*ring[i][0]-ring[i][1]*ring[j][0]; a+=f; cx+=(ring[j][1]+ring[i][1])*f; cy+=(ring[j][0]+ring[i][0])*f; } if(Math.abs(a)<1e-12){ return ring[0]; } a*=0.5; return [cy/(6*a), cx/(6*a)]; }
+
+function _mxBounds(cams){ let la1=90,la2=-90,lo1=180,lo2=-180; const scan=f=>f.forEach(p=>{ la1=Math.min(la1,p[0]); la2=Math.max(la2,p[0]); lo1=Math.min(lo1,p[1]); lo2=Math.max(lo2,p[1]); });
+  cams.forEach(g=>{ g.linhas.forEach(scan); g.areas.forEach(scan); }); return [[la1,lo1],[la2,lo2]]; }
+
+function _mxHTML(dados, cfg){
+  const J=JSON.stringify(dados);
+  return `<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0">
+<title>${_mxEsc(cfg.titulo)}</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"><\/script>
+<style>
+:root{--painel:#fff;--borda:#d8ded6;--tinta:#1c2a20;--tinta2:#5a6b5e;--verde:#2e7d46}
+*{box-sizing:border-box;margin:0;padding:0}html,body{height:100%}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;overflow:hidden}
+#mapa{position:absolute;inset:0;background:#eef1ee}
+.cx{position:absolute;z-index:1000;background:var(--painel);border:1px solid var(--borda);border-radius:10px;box-shadow:0 2px 10px rgba(0,0,0,.14)}
+#titulo{left:10px;top:10px;padding:9px 12px;max-width:62%}#titulo b{font-size:13px;display:block;color:var(--tinta)}
+#titulo small{color:var(--tinta2);font-size:10.5px}
+#painel{top:10px;right:10px;width:230px;max-height:calc(100% - 20px);display:flex;flex-direction:column}
+#painel h2{font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--tinta2);padding:9px 12px 4px;font-weight:700;display:flex;justify-content:space-between;align-items:center}
+#painel h2 b{cursor:pointer}
+#lista{overflow:auto;padding:2px 8px 8px}
+.cam{display:flex;align-items:center;gap:7px;padding:4px 3px;border-radius:6px}.cam:hover{background:#f4f7f3}
+.cam label{display:flex;align-items:center;gap:8px;flex:1;min-width:0;cursor:pointer}
+.cam input{width:16px;height:16px;accent-color:var(--verde);flex:none}
+.cam i{flex:none;width:22px;height:0;border-top:3px solid;border-radius:2px}
+.cam i.pg{height:13px;border:2px solid;border-top-width:2px;background:rgba(0,0,0,.04)}
+.cam span{font-size:12px;color:var(--tinta);word-break:break-word;line-height:1.2}
+.rodape{border-top:1px solid var(--borda);padding:8px;display:flex;flex-direction:column;gap:6px}
+.rodape label{display:flex;gap:7px;align-items:center;font-size:11.5px;color:var(--tinta2);cursor:pointer}
+.rodape input{accent-color:var(--verde)}
+#leg{left:10px;bottom:22px;max-width:46%;max-height:50%;overflow:auto;padding:8px 10px}
+#leg .t{font-weight:800;font-size:10px;text-transform:uppercase;letter-spacing:.5px;color:var(--tinta2);margin-bottom:4px}
+#leg .it{display:flex;align-items:center;gap:7px;margin:3px 0;font-size:11.5px;color:var(--tinta)}
+#leg .it i{flex:none;width:18px;height:0;border-top:3px solid;border-radius:2px}
+#leg .it i.pg{height:11px;border:2px solid;border-top-width:2px}
+#gps{right:10px;bottom:30px;width:44px;height:44px;display:flex;align-items:center;justify-content:center;cursor:pointer;z-index:1200}
+#gps svg{width:22px;height:22px;color:var(--verde)}
+.rot{background:none;border:none;color:#fff;font-weight:700;font-size:11px;text-shadow:0 0 3px #000,0 0 3px #000;white-space:nowrap}
+.rot:before{display:none}
+.leaflet-control-scale{margin:0 0 8px 10px!important}
+.me{width:16px;height:16px;border-radius:50%;background:#2d7dd2;border:2px solid #fff;box-shadow:0 0 0 2px #2d7dd2}
+</style></head><body>
+<div id="mapa"></div>
+<div id="titulo" class="cx"><b>${_mxEsc(cfg.titulo)}</b>${cfg.sub?('<small>'+_mxEsc(cfg.sub)+'</small>'):''}</div>
+<div id="painel" class="cx"><h2>Camadas <b id="tgl">—</b></h2><div id="lista"></div>
+  <div class="rodape"><label><input type="checkbox" id="ck-sat" checked> Satélite</label></div></div>
+<div id="leg" class="cx"></div>
+<div id="gps" class="cx" title="Minha localização"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/></svg></div>
+<script>
+const DADOS=${J};
+const map=L.map('mapa',{zoomControl:true,attributionControl:false});
+const gsat=L.tileLayer('https://mt{s}.google.com/vt/lyrs=s&x={x}&y={y}&z={z}',{subdomains:['0','1','2','3'],maxZoom:21,maxNativeZoom:21});
+const esri=L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',{maxZoom:21});
+let fundo=gsat; gsat.on('tileerror',()=>{ if(fundo===gsat){ map.removeLayer(gsat); fundo=esri; esri.addTo(map); } });
+fundo.addTo(map);
+L.control.scale({imperial:false,metric:true}).addTo(map);
+const grupos=[];
+DADOS.camadas.forEach(c=>{
+  const fg=L.featureGroup();
+  c.linhas.forEach(pts=>L.polyline(pts,{color:c.cor,weight:3,opacity:.95}).addTo(fg));
+  c.areas.forEach(pts=>L.polygon(pts,{color:c.cor,weight:2,fillColor:c.cor,fillOpacity:.18}).addTo(fg));
+  (c.rotulos||[]).forEach(r=>{ L.marker(r.p,{icon:L.divIcon({className:'rot',html:r.txt,iconSize:[0,0]})}).addTo(fg); });
+  fg.addTo(map); grupos.push({c,fg});
+});
+if(DADOS.bounds) map.fitBounds(DADOS.bounds,{padding:[30,30]}); else map.setView([-21,-51],13);
+// painel
+const lista=document.getElementById('lista');
+grupos.forEach((G,i)=>{ const d=document.createElement('div'); d.className='cam';
+  d.innerHTML='<label><input type="checkbox" checked><i class="'+(G.c.areas.length&&!G.c.linhas.length?'pg':'')+'" style="border-color:'+G.c.cor+';color:'+G.c.cor+';background:'+(G.c.areas.length&&!G.c.linhas.length?G.c.cor+'22':'')+'"></i><span>'+G.c.nome+'</span></label>';
+  d.querySelector('input').onchange=e=>{ if(e.target.checked) G.fg.addTo(map); else map.removeLayer(G.fg); };
+  lista.appendChild(d); });
+document.getElementById('tgl').onclick=()=>{ const l=document.getElementById('lista'); l.style.display=l.style.display==='none'?'block':'none'; };
+document.getElementById('ck-sat').onchange=e=>{ if(e.target.checked) fundo.addTo(map); else map.removeLayer(fundo); };
+// legenda
+const leg=document.getElementById('leg'); leg.innerHTML='<div class="t">Legenda</div>'+DADOS.camadas.map(c=>'<div class="it"><i class="'+(c.areas.length&&!c.linhas.length?'pg':'')+'" style="border-color:'+c.cor+';color:'+c.cor+'"></i>'+c.nome+'</div>').join('');
+// GPS
+let meMarker=null;
+document.getElementById('gps').onclick=()=>{ if(!navigator.geolocation){ alert('GPS não disponível neste navegador.'); return; }
+  navigator.geolocation.getCurrentPosition(p=>{ const ll=[p.coords.latitude,p.coords.longitude]; if(meMarker) meMarker.setLatLng(ll); else meMarker=L.marker(ll,{icon:L.divIcon({className:'',html:'<div class=me></div>',iconSize:[16,16]})}).addTo(map); map.setView(ll,Math.max(map.getZoom(),17)); },
+    e=>alert('Não consegui pegar a localização. Em alguns navegadores o GPS só funciona em site https.'),{enableHighAccuracy:true,timeout:10000}); };
+<\/script></body></html>`;
+}
+
+function mxDialog(){
+  const vis=_mxVisiveis();
+  if(!vis.length){ log('Exportar mapa: não há linhas visíveis no desenho.','e'); return; }
+  const docN=(typeof docActive==='function'&&docActive()?docActive().name:'Projeto').replace(/\*$/,'');
+  modalHTML(`<h3>Exportar mapa (HTML)</h3>
+    <div style="font-size:10.5px;color:var(--ink-dim)">Gera um HTML que abre no navegador (PC, Android, iPhone), com fundo de satélite, camadas por checkbox, legenda e GPS — como o visualizador do QGIS. Só os vetores visíveis entram.</div>
+    <label>Título<input type="text" id="mx_tit" value="${_mxEsc(docN)}"></label>
+    <label>Subtítulo <small>(opcional)</small><input type="text" id="mx_sub" value=""></label>
+    <label>Rótulos nas feições<select id="mx_rot"><option value="">Nenhum</option><option value="talhao">Nome do talhão (CFT)</option><option value="num">Numerar as linhas</option></select></label>
+    <div style="font-size:9.5px;color:var(--ink-dim);margin-top:4px">Dica: ligue a visualização por Cliente/Fazenda/Talhão antes de exportar pra separar as camadas por talhão com as cores da classificação.</div>
+    <div class="row"><button class="cancel" id="mx_x">Cancelar</button><button class="ok" id="mx_go">Gerar HTML</button></div>`);
+  const $=id=>document.getElementById(id);
+  $('mx_x').onclick=closeModal;
+  $('mx_go').onclick=()=>{
+    const cfg={ titulo:($('mx_tit').value||'Projeto').trim(), sub:$('mx_sub').value.trim() };
+    const cams=_mxCamadas({ rotulos:$('mx_rot').value });
+    if(!cams.length){ log('Exportar mapa: nada pra exportar.','e'); return; }
+    const dados={ camadas:cams, bounds:_mxBounds(cams), titulo:cfg.titulo };
+    const html=_mxHTML(dados, cfg); closeModal();
+    const nome=('MAPA_'+cfg.titulo).replace(/[^\w\-]+/g,'_')+'.html';
+    const blob=new Blob([html],{type:'text/html'});
+    const toque=window.matchMedia&&matchMedia('(pointer:coarse)').matches;
+    const baixar=()=>{ const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=nome; document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(a.href),4000); };
+    try{ const f=new File([blob],nome,{type:'text/html'}); if(toque&&navigator.canShare&&navigator.canShare({files:[f]})) navigator.share({files:[f],title:nome}).catch(e=>{ if(e&&e.name!=='AbortError') baixar(); }); else baixar(); }catch(_){ baixar(); }
+    let nl=0,na=0; cams.forEach(c=>{ nl+=c.linhas.length; na+=c.areas.length; });
+    log(`Mapa HTML exportado: ${nome} — ${cams.length} camada(s), ${nl} linha(s), ${na} área(s). Abre no navegador com satélite e GPS.`,'g');
+  };
+}
+['EXPMAPA','MAPAHTML','EXPORTARMAPA','MAPA'].forEach(a=>{ try{ ALIASES[a]='EXPMAPA'; }catch(_){} });
+if(typeof CMD_DESC!=='undefined') CMD_DESC.EXPMAPA='Exportar mapa do projeto como HTML (satélite + camadas + legenda)';
+{ const _st=startTool; startTool=function(c){ if(c==='EXPMAPA'){ try{ LAST_CMD=c; }catch(_){} if(typeof tool!=='undefined') tool.reset(); mxDialog(); return; } return _st.apply(this,arguments); }; }
 
 </script>
 </body>
