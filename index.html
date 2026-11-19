@@ -2201,6 +2201,7 @@ function showCanvasMenu(x,y){
     'sep',
     {label:'💾 Salvar no navegador agora', fn:autosaveNow},
     {label:'🕑 Pontos de restauração…', fn:safeRestoreDialog},
+    {label:'☁ Nuvem (salvar/abrir online)…', fn:cloudDialog},
     {label:'🧹 Limpar projeto salvo (autosave)', fn:limparAutosave},
     'sep',
     {label:'⚙ Configurações (cursor/seleção)', fn:()=>{ const cp=document.getElementById('cfgPanel'); if(cp) cp.style.display='flex'; }}
@@ -11646,6 +11647,154 @@ function safeToast(msg){
 ['RESTAURAR','PONTOS','RECUPERAR','BACKUP'].forEach(a=>{ try{ ALIASES[a]='RESTAURAR'; }catch(_){} });
 if(typeof CMD_DESC!=='undefined') CMD_DESC.RESTAURAR='Pontos de restauração (histórico do desenho no navegador)';
 { const _st=startTool; startTool=function(c){ if(c==='RESTAURAR'){ try{ LAST_CMD=c; }catch(_){} if(typeof tool!=='undefined') tool.reset(); safeRestoreDialog(); return; } return _st.apply(this,arguments); }; }
+
+
+
+/* =====================================================================
+   NUVEM (Cloudflare)  — salvar/abrir projetos online por chave de licença
+   Offline-first: se não houver internet ou chave, o app segue normal e o
+   trabalho continua salvo localmente (autosave + pontos de restauração).
+   Só o desenho (.json) vai pra nuvem; MDT/orto continuam locais.
+   ===================================================================== */
+const CLOUD = {
+  base: '',            // URL do Worker, ex.: https://linhaspro.SEU.workers.dev  (dá pra setar no diálogo)
+  key: '', name: '', exp: null, plan: '',
+};
+try { CLOUD.base = localStorage.getItem('lp_cloud_base') || CLOUD.base; } catch (_) {}
+try { CLOUD.key = localStorage.getItem('lp_cloud_key') || ''; } catch (_) {}
+
+function _cloudSave() { try { localStorage.setItem('lp_cloud_base', CLOUD.base || ''); localStorage.setItem('lp_cloud_key', CLOUD.key || ''); } catch (_) {} }
+function _cloudHdr(extra) { return Object.assign({ 'Authorization': 'Bearer ' + CLOUD.key }, extra || {}); }
+function _cloudURL(p) { return (CLOUD.base || '').replace(/\/+$/, '') + p; }
+function _cloudData(ts) { try { return new Date(ts).toLocaleString('pt-BR'); } catch (_) { return ts || ''; } }
+
+async function cloudFetch(path, opt) {
+  if (!CLOUD.base) throw new Error('Defina o endereço do servidor.');
+  let r;
+  try { r = await fetch(_cloudURL(path), opt); }
+  catch (e) { throw new Error('sem_internet'); }
+  return r;
+}
+async function cloudLogin(key) {
+  CLOUD.key = (key || '').trim();
+  const r = await cloudFetch('/api/login', { method: 'POST', headers: _cloudHdr() });
+  const j = await r.json().catch(() => ({}));
+  if (r.ok && j.ok) { CLOUD.name = j.name; CLOUD.exp = j.exp; CLOUD.plan = j.plan; _cloudSave(); return { ok: true, j }; }
+  CLOUD.name = ''; CLOUD.exp = null;
+  return { ok: false, reason: j.reason || ('http ' + r.status), exp: j.exp };
+}
+async function cloudListar() {
+  const r = await cloudFetch('/api/projects', { headers: _cloudHdr() });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok || !j.ok) throw new Error(j.reason || ('http ' + r.status));
+  return j.projects || [];
+}
+async function cloudSalvar(nome) {
+  const corpo = JSON.stringify(snapshotProject());
+  const r = await cloudFetch('/api/project/' + encodeURIComponent(nome), { method: 'PUT', headers: _cloudHdr({ 'Content-Type': 'application/json' }), body: corpo });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok || !j.ok) throw new Error(j.error || j.reason || ('http ' + r.status));
+  return j;
+}
+async function cloudBaixar(nome) {
+  const r = await cloudFetch('/api/project/' + encodeURIComponent(nome), { headers: _cloudHdr() });
+  if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(j.error || ('http ' + r.status)); }
+  return await r.json();
+}
+async function cloudApagar(nome) {
+  const r = await cloudFetch('/api/project/' + encodeURIComponent(nome), { method: 'DELETE', headers: _cloudHdr() });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok || !j.ok) throw new Error(j.error || ('http ' + r.status));
+  return j;
+}
+
+function _cloudEsc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+
+function cloudDialog() {
+  const box = document.getElementById('modalbox'); if (box) box.style.width = '520px';
+  const logado = !!(CLOUD.key && CLOUD.name);
+  const expTxt = CLOUD.exp ? ('válido até ' + _cloudData(CLOUD.exp * 1000)) : (logado ? 'sem expiração' : '');
+  const nomeAtual = (typeof docActive === 'function' && docActive() ? docActive().name : 'Projeto').replace(/\*$/, '');
+  modalHTML(`
+    <style>
+      #cl-wrap label{margin:6px 0 0}
+      #cl-status{font-size:11px;padding:6px 8px;border-radius:4px;margin-top:4px}
+      #cl-status.ok{background:#17371f;border:1px solid #2e7d46;color:#b7f0c6}
+      #cl-status.off{background:#3a2420;border:1px solid #7d3a2e;color:#ffd0c6}
+      #cl-list{max-height:40vh;overflow:auto;margin-top:4px;border:1px solid var(--line);border-radius:4px}
+      .cl-it{display:flex;gap:8px;align-items:center;justify-content:space-between;padding:6px 8px;border-top:1px solid var(--line)}
+      .cl-it:first-child{border-top:0}
+      .cl-it small{color:var(--ink-dim)}
+      .cl-bt{padding:3px 9px;font-size:11px;border-radius:4px;cursor:pointer}
+    </style>
+    <div id="cl-wrap">
+      <h3>Nuvem — projetos online</h3>
+      <div id="cl-status" class="${logado ? 'ok' : 'off'}">${logado ? ('Conectado: <b>' + _cloudEsc(CLOUD.name) + '</b> · ' + expTxt) : 'Não conectado. Cole sua chave de licença abaixo.'}</div>
+      <details ${CLOUD.base ? '' : 'open'} style="margin-top:6px">
+        <summary style="cursor:pointer;font-size:10.5px;color:var(--ink-dim)">Endereço do servidor</summary>
+        <input type="text" id="cl-base" placeholder="https://linhaspro.SEU.workers.dev" value="${_cloudEsc(CLOUD.base)}" style="width:100%;margin-top:4px">
+      </details>
+      <div id="cl-auth" style="display:${logado ? 'none' : 'block'}">
+        <label>Chave de licença</label>
+        <div style="display:flex;gap:6px"><input type="text" id="cl-key" placeholder="cole a chave aqui" value="${_cloudEsc(CLOUD.key)}" style="flex:1"><button class="ok" id="cl-login" style="flex:0 0 auto">Entrar</button></div>
+      </div>
+      <div id="cl-painel" style="display:${logado ? 'block' : 'none'}">
+        <label>Salvar o desenho atual na nuvem</label>
+        <div style="display:flex;gap:6px"><input type="text" id="cl-nome" value="${_cloudEsc(nomeAtual)}" style="flex:1"><button class="ok" id="cl-save" style="flex:0 0 auto">Salvar na nuvem</button></div>
+        <label style="display:flex;justify-content:space-between;align-items:center">Meus projetos na nuvem <button class="cancel" id="cl-ref" style="padding:1px 8px;font-size:10.5px">Atualizar</button></label>
+        <div id="cl-list"><div style="padding:8px;font-size:11px;color:var(--ink-dim)">Carregando…</div></div>
+      </div>
+      <div id="cl-msg" style="font-size:10.5px;color:var(--ink-dim);min-height:16px;margin-top:6px"></div>
+      <div class="row"><button class="cancel" id="cl-x">Fechar</button>${logado ? '<button class="cancel" id="cl-out">Sair desta conta</button>' : ''}</div>
+      <div style="font-size:9.5px;color:var(--ink-dim);margin-top:6px;line-height:1.4">Só o desenho vai pra nuvem (MDT/orto ficam no aparelho). Sem internet, o app funciona igual e o trabalho continua salvo localmente.</div>
+    </div>`);
+  const $ = id => document.getElementById(id);
+  const msg = (t, erro) => { $('cl-msg').innerHTML = (erro ? '<span style="color:#ff6b5e">' : '<span style="color:#7ee0a0">') + _cloudEsc(t) + '</span>'; };
+  const err = e => { const m = String(e && e.message || e); if (m === 'sem_internet') return 'Sem internet — nada foi enviado. Seu desenho está salvo aqui no aparelho.'; if (m === 'expirada') return 'Licença expirada. Fale com o fornecedor pra renovar.'; if (m === 'assinatura' || m === 'formato' || m === 'invalida') return 'Chave inválida.'; return 'Erro: ' + m; };
+  if ($('cl-base')) $('cl-base').oninput = () => { CLOUD.base = $('cl-base').value.trim(); _cloudSave(); };
+  $('cl-x').onclick = () => { if (box) box.style.width = ''; closeModal(); };
+  if ($('cl-out')) $('cl-out').onclick = () => { CLOUD.key = ''; CLOUD.name = ''; CLOUD.exp = null; _cloudSave(); cloudDialog(); };
+
+  async function pintarLista() {
+    try { const ps = await cloudListar();
+      $('cl-list').innerHTML = ps.length ? ps.map(p => `<div class="cl-it"><div><b>${_cloudEsc(p.name)}</b><br><small>${p.updatedAt ? _cloudData(p.updatedAt) : ''}${p.nEnts ? ' · ' + p.nEnts + ' objeto(s)' : ''}</small></div>
+        <div style="display:flex;gap:5px"><button class="ok cl-bt cl-open" data-n="${_cloudEsc(p.name)}">Abrir</button><button class="cancel cl-bt cl-del" data-n="${_cloudEsc(p.name)}">Apagar</button></div></div>`).join('')
+        : '<div style="padding:8px;font-size:11px;color:var(--ink-dim)">Nenhum projeto salvo na nuvem ainda.</div>';
+      $('cl-list').querySelectorAll('.cl-open').forEach(b => b.onclick = () => abrir(b.dataset.n));
+      $('cl-list').querySelectorAll('.cl-del').forEach(b => b.onclick = async () => { if (!confirm('Apagar "' + b.dataset.n + '" da nuvem? (não afeta o que está no aparelho)')) return; try { await cloudApagar(b.dataset.n); msg('Apagado da nuvem.'); pintarLista(); } catch (e) { msg(err(e), true); } });
+    } catch (e) { $('cl-list').innerHTML = '<div style="padding:8px;font-size:11px;color:#ff8">' + _cloudEsc(err(e)) + '</div>'; }
+  }
+  async function abrir(nome) {
+    msg('Baixando "' + nome + '"…');
+    try {
+      const snap = await cloudBaixar(nome);
+      if (typeof docNew === 'function') docNew(nome.slice(0, 40), true);
+      applyProject(snap);
+      if (typeof docMarkDirty === 'function') docMarkDirty();
+      try { zoomExtents(); } catch (_) {}
+      if (box) box.style.width = ''; closeModal();
+      log('Projeto "' + nome + '" aberto da nuvem em um novo desenho.', 'g');
+    } catch (e) { msg(err(e), true); }
+  }
+  if ($('cl-login')) $('cl-login').onclick = async () => {
+    msg('Entrando…');
+    try { const r = await cloudLogin($('cl-key').value); if (r.ok) { cloudDialog(); setTimeout(pintarLista, 50); } else { msg(err({ message: r.reason }), true); } }
+    catch (e) { msg(err(e), true); }
+  };
+  if ($('cl-save')) $('cl-save').onclick = async () => {
+    const nome = ($('cl-nome').value || '').trim(); if (!nome) { msg('Dê um nome ao projeto.', true); return; }
+    msg('Salvando na nuvem…');
+    try { const j = await cloudSalvar(nome); msg('Salvo na nuvem: ' + nome + ' (' + j.bytes + ' bytes).'); pintarLista(); log('Projeto "' + nome + '" salvo na nuvem.', 'g'); }
+    catch (e) { msg(err(e), true); }
+  };
+  if ($('cl-ref')) $('cl-ref').onclick = pintarLista;
+  if (logado) pintarLista();
+}
+
+/* comando / atalhos / menu */
+['NUVEM', 'CLOUD', 'ONLINE', 'SYNC'].forEach(a => { try { ALIASES[a] = 'NUVEM'; } catch (_) {} });
+if (typeof CMD_DESC !== 'undefined') CMD_DESC.NUVEM = 'Nuvem — salvar/abrir projetos online (chave de licença)';
+{ const _st = startTool; startTool = function (c) { if (c === 'NUVEM') { try { LAST_CMD = c; } catch (_) {} if (typeof tool !== 'undefined') tool.reset(); cloudDialog(); return; } return _st.apply(this, arguments); }; }
 
 </script>
 </body>
