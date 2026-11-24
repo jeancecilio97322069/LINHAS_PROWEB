@@ -1905,7 +1905,7 @@ function executeTrimAtPoint(clickPt){
     pushState();
     ents = ents.filter(x => x !== target);
     keptPieces.forEach(pc => {
-      commit({ type: target.type, pts: pc, layer: target.layer, color: target.color });
+      commit({ type: target.type, pts: pc, layer: target.layer, color: target.color, cft: target.cft?{...target.cft}:undefined });
     });
     log('Trecho aparado com sucesso.', 'g');
     S.dirty = true;
@@ -1985,8 +1985,8 @@ function onPick(p){
       const half=Math.floor(hit.pts.length/2)||1;
       pushState();
       ents=ents.filter(x=>x!==hit);
-      commit({type:hit.type,pts:hit.pts.slice(0,half+1),layer:hit.layer});
-      commit({type:hit.type,pts:hit.pts.slice(half),layer:hit.layer});
+      commit({type:hit.type,pts:hit.pts.slice(0,half+1),layer:hit.layer,cft:hit.cft?{...hit.cft}:undefined});
+      commit({type:hit.type,pts:hit.pts.slice(half),layer:hit.layer,cft:hit.cft?{...hit.cft}:undefined});
       log('Linha quebrada.','g');
     }
     tool.reset();
@@ -2493,7 +2493,7 @@ function doJoin(){
   }
 
   ents = ents.filter(e => !used.has(e));
-  const merged = commit({ type: 'pline', pts: chain, layer: sel[0].layer });
+  const merged = commit({ type: 'pline', pts: chain, layer: sel[0].layer, cft: sel[0].cft?{...sel[0].cft}:undefined });
   selection.clear(); selection.add(merged.id);
   updateProps(); renderLayers(); S.dirty = true;
   log(`JOIN: ${used.size} segmentos unidos em uma polilinha contínua.`, 'g');
@@ -2525,7 +2525,7 @@ function handleOffsetClick(p){
   const count = sgn > 0 ? (++offsetState.countPos) : (++offsetState.countNeg);
   const offsetPts = offsetPolyline(base, offsetState.dist * sgn * count);
   
-  commit({ type: 'pline', pts: offsetPts, layer: activeLayer, closed: offsetState.baseEnt.closed });
+  commit({ type: 'pline', pts: offsetPts, layer: activeLayer, closed: offsetState.baseEnt.closed, cft: offsetState.baseEnt.cft?{...offsetState.baseEnt.cft}:undefined });
   log(`Paralela ${count} criada no lado ${sgn > 0 ? 'Direito/Superior' : 'Esquerdo/Inferior'}.`, 'g');
   S.dirty = true;
 }
@@ -2553,10 +2553,10 @@ function startOffsetPassadasAuto(){
       if(boundaryPoly){
         const clipped = clipLineByPolygon(rawOffset, boundaryPoly.pts);
         clipped.forEach(seg => {
-          if(seg.length > 1){ commit({ type:'pline', pts: seg, layer: activeLayer }); generated++; }
+          if(seg.length > 1){ commit({ type:'pline', pts: seg, layer: activeLayer, cft: target.cft?{...target.cft}:undefined }); generated++; }
         });
       } else {
-        commit({ type:'pline', pts: rawOffset, layer: activeLayer });
+        commit({ type:'pline', pts: rawOffset, layer: activeLayer, cft: target.cft?{...target.cft}:undefined });
         generated++;
       }
     }
@@ -12105,6 +12105,255 @@ function mxDialog(){
 ['EXPMAPA','MAPAHTML','EXPORTARMAPA','MAPA'].forEach(a=>{ try{ ALIASES[a]='EXPMAPA'; }catch(_){} });
 if(typeof CMD_DESC!=='undefined') CMD_DESC.EXPMAPA='Exportar mapa do projeto como HTML (satélite + camadas + legenda)';
 { const _st=startTool; startTool=function(c){ if(c==='EXPMAPA'){ try{ LAST_CMD=c; }catch(_){} if(typeof tool!=='undefined') tool.reset(); mxDialog(); return; } return _st.apply(this,arguments); }; }
+
+/* ===================== EXPORTAÇÃO STARA ============================
+   Monitor Stara (Topper / mapa de pulverização e plantio).
+   Replica a estrutura real do export do monitor:
+     Stara/Dados/Clientes/<CLIENTE>/Fazendas/<FAZENDA>/Talhoes/<TALHAO>/
+         CURVA.shp            (PolyLine 2D WGS84 — linhas de guiagem)
+         LIMITE EXTERNO.shp   (Polygon  2D WGS84 — contorno do talhão)
+       dbf ANSI (LDID 0x59), campos Name/Client/Farm/Field  C(255)
+     Stara/Dados/Talhoes/<TALHAO>-<TALHAO>/
+         CURVA.shp            (PolyLine) · dbf 1 campo FID C(255) = "CURVA"
+         <TALHAO>.shp         (Polygon)  · dbf 1 campo FID C(255) = "LIMITE EXTERNO"
+   As duas árvores saem no mesmo pacote, igual ao export de fábrica.
+   Entra: linhas classificadas (CFT). Fechadas (_perim) viram LIMITE EXTERNO;
+   abertas viram CURVA. Coordenadas já chegam em [lon,lat] WGS84.          */
+(function(){
+  if(typeof CONV==='undefined' || !CONV.WRITERS){ return; }
+  const PRJ='GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",SPHEROID["WGS_1984",6378137,298.257223562997]],PRIMEM["Greenwich",0],UNIT["Degree",0.0174532925199433]]\r\n';
+  const LDID=0x59; // ANSI / Windows-1252 (igual ao export real)
+
+  function safe(s){ s=String(s==null?"":s).trim(); for(const c of '\\/:*?"<>|') s=s.split(c).join("_"); return s.replace(/\.+$/,"")||"SEM_NOME"; }
+  const CP={0x20AC:0x80,0x201A:0x82,0x0192:0x83,0x201E:0x84,0x2026:0x85,0x2020:0x86,0x2021:0x87,0x02C6:0x88,0x2030:0x89,0x0160:0x8A,0x2039:0x8B,0x0152:0x8C,0x017D:0x8E,0x2018:0x91,0x2019:0x92,0x201C:0x93,0x201D:0x94,0x2022:0x95,0x2013:0x96,0x2014:0x97,0x02DC:0x98,0x2122:0x99,0x0161:0x9A,0x203A:0x9B,0x0153:0x9C,0x017E:0x9E,0x0178:0x9F};
+  function enc(str){ const o=[]; for(const ch of String(str)){ const c=ch.codePointAt(0); o.push(c<0x80||(c>=0xA0&&c<=0xFF)?c:(CP[c]||0x3F)); } return o; }
+
+  /* garante anel fechado e orientação horária (outer ring CW, igual ao Stara) */
+  function prepRing(pts){
+    const p=pts.map(q=>[q[0],q[1]]);
+    if(p.length && (p[0][0]!==p[p.length-1][0] || p[0][1]!==p[p.length-1][1])) p.push([p[0][0],p[0][1]]);
+    let a=0; for(let i=0;i<p.length-1;i++) a+=p[i][0]*p[i+1][1]-p[i+1][0]*p[i][1];
+    if(a>0) p.reverse(); // >0 = anti-horário -> inverte para horário
+    return p;
+  }
+
+  /* records:[{parts:[[ [x,y],... ]], values:[...]}]  fields:[{name,len}]  st:3 PolyLine | 5 Polygon */
+  function shpPair(records, st){
+    let X0=Infinity,Y0=Infinity,X1=-Infinity,Y1=-Infinity;
+    const bodies=records.map(r=>{
+      const parts=r.parts, np=parts.length, npt=parts.reduce((s,p)=>s+p.length,0);
+      let bx0=Infinity,by0=Infinity,bx1=-Infinity,by1=-Infinity;
+      for(const p of parts) for(const q of p){ if(q[0]<bx0)bx0=q[0]; if(q[0]>bx1)bx1=q[0]; if(q[1]<by0)by0=q[1]; if(q[1]>by1)by1=q[1]; }
+      X0=Math.min(X0,bx0);Y0=Math.min(Y0,by0);X1=Math.max(X1,bx1);Y1=Math.max(Y1,by1);
+      const b=new DataView(new ArrayBuffer(44+np*4+npt*16));
+      b.setInt32(0,st,true); b.setFloat64(4,bx0,true);b.setFloat64(12,by0,true);b.setFloat64(20,bx1,true);b.setFloat64(28,by1,true);
+      b.setInt32(36,np,true); b.setInt32(40,npt,true);
+      let k=0,pi=0; for(const p of parts){ b.setInt32(44+pi*4,k,true); pi++; k+=p.length; }
+      let off=44+np*4; for(const p of parts) for(const q of p){ b.setFloat64(off,q[0],true); b.setFloat64(off+8,q[1],true); off+=16; }
+      return new Uint8Array(b.buffer);
+    });
+    if(!records.length){ X0=Y0=X1=Y1=0; }
+    const mkHdr=(lenBytes)=>{ const h=new DataView(new ArrayBuffer(100));
+      h.setInt32(0,9994,false); h.setInt32(24,lenBytes/2,false); h.setInt32(28,1000,true); h.setInt32(32,st,true);
+      h.setFloat64(36,X0,true);h.setFloat64(44,Y0,true);h.setFloat64(52,X1,true);h.setFloat64(60,Y1,true); return new Uint8Array(h.buffer); };
+    const shpLen=100+bodies.reduce((s,b)=>s+8+b.length,0);
+    const shp=new Uint8Array(shpLen), shx=new Uint8Array(100+8*bodies.length);
+    shp.set(mkHdr(shpLen),0); shx.set(mkHdr(shx.length),0);
+    let off=100;
+    bodies.forEach((b,i)=>{
+      const rh=new DataView(shp.buffer,off,8); rh.setInt32(0,i+1,false); rh.setInt32(4,b.length/2,false);
+      shp.set(b,off+8);
+      const xh=new DataView(shx.buffer,100+i*8,8); xh.setInt32(0,off/2,false); xh.setInt32(4,b.length/2,false);
+      off+=8+b.length;
+    });
+    return {shp,shx};
+  }
+
+  function dbfBytes(records, fields){
+    const hl=32+fields.length*32+1, rl=1+fields.reduce((s,f)=>s+f.len,0);
+    const dbf=new Uint8Array(hl+rl*records.length+1), dd=new DataView(dbf.buffer);
+    const now=new Date(); dbf[0]=3; dbf[1]=now.getFullYear()-1900; dbf[2]=now.getMonth()+1; dbf[3]=now.getDate();
+    dd.setUint32(4,records.length,true); dd.setUint16(8,hl,true); dd.setUint16(10,rl,true); dbf[29]=LDID;
+    fields.forEach((f,i)=>{ const p=32+i*32; const nb=enc(f.name).slice(0,10); nb.forEach((c,j)=>dbf[p+j]=c);
+      dbf[p+11]='C'.charCodeAt(0); dbf[p+16]=f.len; dbf[p+17]=0; });
+    dbf[hl-1]=0x0D;
+    records.forEach((r,ri)=>{
+      let o=hl+ri*rl; dbf[o++]=0x20;
+      fields.forEach((f,fi)=>{
+        let b=enc(r.values[fi]==null?"":r.values[fi]);
+        while(b.length>f.len) b.pop();
+        for(let j=0;j<f.len;j++) dbf[o+j]= j<b.length? b[j] : 0x20;
+        o+=f.len;
+      });
+    });
+    dbf[dbf.length-1]=0x1A;
+    return dbf;
+  }
+
+  function fileSet(prefix, records, fields, st){
+    const w=shpPair(records, st);
+    return [{name:prefix+".shp",data:w.shp},{name:prefix+".shx",data:w.shx},
+            {name:prefix+".dbf",data:dbfBytes(records,fields)},{name:prefix+".prj",data:new TextEncoder().encode(PRJ)}];
+  }
+
+  const F_CFT=[{name:"Name",len:255},{name:"Client",len:255},{name:"Farm",len:255},{name:"Field",len:255}];
+  const F_FID=[{name:"FID",len:255}];
+
+  function writeStara(lines, opts){
+    opts=opts||{};
+    // agrupa por Cliente/Fazenda/Talhão
+    const groups=new Map();
+    for(const l of lines){ const k=l.client+"\u0001"+l.farm+"\u0001"+l.field;
+      if(!groups.has(k)) groups.set(k,{c:l.client,f:l.farm,t:l.field,curvas:[],limites:[]});
+      const g=groups.get(k);
+      for(const p of l.parts){ if(!p||p.length<2) continue; (l._perim?g.limites:g.curvas).push(p); }
+    }
+    const files=[];
+    for(const g of groups.values()){
+      const C=safe(g.c), Fa=safe(g.f), T=safe(g.t);
+      const dirCli=`Stara/Dados/Clientes/${C}/Fazendas/${Fa}/Talhoes/${T}/`;
+      const dirFlat=`Stara/Dados/Talhoes/${T}-${T}/`;
+      // ----- CURVA (PolyLine) -----
+      if(g.curvas.length){
+        const recCli=g.curvas.map(p=>({parts:[p],values:["CURVA",g.c,g.f,g.t]}));
+        const recFid=g.curvas.map(p=>({parts:[p],values:["CURVA"]}));
+        files.push(...fileSet(dirCli+"CURVA", recCli, F_CFT, 3));
+        files.push(...fileSet(dirFlat+"CURVA", recFid, F_FID, 3));
+      }
+      // ----- LIMITE EXTERNO (Polygon) -----
+      if(g.limites.length){
+        const rings=g.limites.map(prepRing);
+        const recCli=rings.map(p=>({parts:[p],values:["LIMITE EXTERNO",g.c,g.f,g.t]}));
+        const recFid=rings.map(p=>({parts:[p],values:["LIMITE EXTERNO"]}));
+        files.push(...fileSet(dirCli+"LIMITE EXTERNO", recCli, F_CFT, 5));
+        files.push(...fileSet(dirFlat+T, recFid, F_FID, 5));
+      }
+    }
+    return files;
+  }
+
+  CONV.WRITERS.stara={label:"Stara (Topper) — pasta Dados/Clientes + Dados/Talhoes", prefix:"Stara", ext:"zip", fn:(ls,o)=>writeStara(ls,o)};
+  if(typeof CFT_OUTS!=='undefined'){
+    const it=CFT_OUTS.findIndex(o=>o[0]==='topcon');
+    CFT_OUTS.splice(it>=0?it+1:CFT_OUTS.length,0,['stara','Stara (Topper — pulverização/plantio) — estrutura Dados/']);
+  }
+})();
+
+/* ===================== IMPORTAÇÃO STARA ============================
+   Lê de volta a pasta Dados/ do monitor Stara (Topper) já classificada.
+   Prefere a árvore Dados/Clientes (tem Cliente/Fazenda/Talhão no dbf);
+   se só existir Dados/Talhoes (dbf só com FID), usa o nome da pasta como
+   talhão. CURVA -> linha aberta; LIMITE EXTERNO / polígono -> contorno.   */
+(function(){
+  if(typeof CONV==='undefined' || !CONV.readShp){ return; }
+  const norm=p=>String(p==null?"":p).replace(/\\/g,'/');
+
+  function keyOf(path){
+    const s=norm(path).split('/'); const low=s.map(x=>x.toLowerCase());
+    const di=low.lastIndexOf('dados'); if(di<0) return null;
+    if(low[di+1]==='clientes' && low[di+3]==='fazendas' && low[di+5]==='talhoes' && s[di+6]!=null)
+      return {tree:'cli', client:s[di+2], farm:s[di+4], field:s[di+6]};
+    if(low[di+1]==='talhoes' && s[di+2]!=null){
+      const dir=s[di+2], field=dir.includes('-')?dir.slice(0,dir.lastIndexOf('-')):dir;
+      return {tree:'flat', client:field, farm:field, field};
+    }
+    return null;
+  }
+
+  function readStara(items){
+    const by=new Map(); for(const it of items) by.set(norm(it.path).toLowerCase(), it);
+    const shps=items.filter(it=>/\.shp$/i.test(norm(it.path)));
+    const tagged=[]; for(const it of shps){ const k=keyOf(it.path); if(k) tagged.push({it,k}); }
+    if(!tagged.length) return {lines:[], warn:['estrutura Stara (Dados/Clientes ou Dados/Talhoes) não encontrada']};
+    const hasCli=tagged.some(t=>t.k.tree==='cli');
+    const use=tagged.filter(t=>t.k.tree===(hasCli?'cli':'flat'));
+    const lines=[], warn=[]; const cnt=new Map(); let projWarned=false;
+    for(const {it,k} of use){
+      const p=norm(it.path), b=p.slice(0,-4);
+      const dbfIt=by.get((b+'.dbf').toLowerCase()), prjIt=by.get((b+'.prj').toLowerCase());
+      let shp; try{ shp=CONV.readShp(it.bytes); }catch(e){ warn.push('falha lendo '+p.split('/').pop()); continue; }
+      let dbf={rows:[]}; if(dbfIt){ try{ dbf=CONV.readDbf(dbfIt.bytes,null); }catch(_){} }
+      let crs=null; if(prjIt){ try{ crs=CONV.parsePrj(new TextDecoder().decode(prjIt.bytes)); }catch(_){} }
+      const needProj = crs && crs.type && crs.type!=='geo' && crs.type!=='unsupported';
+      const proj = needProj ? (q=>CONV.tmInverse(q[0],q[1],crs)) : (q=>[q[0],q[1]]);
+      if(needProj && !projWarned){ projWarned=true; warn.push('coordenadas projetadas convertidas para lat/lon'); }
+      (shp.recs||[]).forEach((r,i)=>{
+        if(!r.parts || !r.parts.length) return;
+        const row=(dbf.rows && dbf.rows[i]) || {};
+        const cli=String(row.Client||row.CLIENT||k.client||'').trim()||'SEM_CLIENTE';
+        const faz=String(row.Farm ||row.FARM ||k.farm ||'').trim()||'SEM_FAZENDA';
+        const tal=String(row.Field||row.FIELD||k.field||'').trim()||'SEM_TALHAO';
+        const isPoly=!!r.poly;
+        const key=cli+'\u0001'+faz+'\u0001'+tal; const n=(cnt.get(key)||0)+1; cnt.set(key,n);
+        lines.push({client:cli,farm:faz,field:tal,
+          name:isPoly?'LIMITE EXTERNO':('CURVA '+n), base:isPoly?undefined:'CURVA',
+          parts:r.parts.map(part=>part.map(proj)), src:'stara', _perim:isPoly});
+      });
+    }
+    if(!lines.length) warn.push('nenhuma linha/contorno encontrado nos .shp da pasta Stara');
+    return {lines,warn};
+  }
+
+  CONV.FORMATS.stara={label:"Stara (Topper) — pasta Dados/"};
+
+  const _det=CONV.detectFormat;
+  CONV.detectFormat=function(items){
+    const shps=(items||[]).filter(i=>/\.shp$/i.test(norm(i.path)));
+    for(const it of shps){ const k=keyOf(it.path); if(!k) continue;
+      const fn=norm(it.path).split('/').pop().toLowerCase();
+      if(k.tree==='cli' || fn==='curva.shp' || fn==='limite externo.shp') return 'stara';
+    }
+    return _det(items);
+  };
+  const _rm=CONV.readMonitor;
+  CONV.readMonitor=async function(fmt,items){
+    if(fmt==='stara') return readStara(items);
+    return _rm(fmt,items);
+  };
+})();
+
+/* ============== HERANÇA DE CLASSIFICAÇÃO PELO CONTORNO ==============
+   Ao criar uma linha NOVA (Linha, Polyline, Spline, Arco) dentro de um
+   contorno de talhão já classificado, ela herda sozinha a classificação
+   daquele talhão — sem precisar rodar "Classificar pelo contorno" na mão.
+   Liga/desliga pelo comando HERDAR (padrão: ligado). Só age em linhas
+   abertas sem classificação; o que já vem classificado (ex.: edição de
+   linha classificada) é preservado e não é tocado.                      */
+(function(){
+  if(typeof commit!=='function' || typeof ents==='undefined') return;
+  try{ if(S.herdarCFT===undefined) S.herdarCFT = (localStorage.getItem('linhaspro_herdarcft')!=='0'); }catch(_){ try{ S.herdarCFT=true; }catch(__){} }
+
+  function _mid(pts){ if(!pts||!pts.length) return null; return pts[pts.length>>1]; }
+  function _area(p){ let a=0; for(let i=0;i<p.length-1;i++) a+=p[i][0]*p[i+1][1]-p[i+1][0]*p[i][1]; return Math.abs(a/2); }
+  function cftAt(pt){
+    if(!pt || typeof pointInPoly!=='function') return null;
+    let best=null,bestA=Infinity;
+    for(const e of ents){ if(e.closed && e.cft && e.pts && e.pts.length>2 && pointInPoly(pt,e.pts)){ const a=_area(e.pts); if(a<bestA){ bestA=a; best=e.cft; } } }
+    return best?{...best}:null;
+  }
+  let _rq=0; function _refreshSoon(){ if(_rq) return; _rq=setTimeout(()=>{ _rq=0; try{ if(typeof cftRefresh==='function') cftRefresh(); if(typeof renderLayers==='function') renderLayers(); }catch(_){}}, 60); }
+
+  const _commit=commit;
+  commit=function(e){
+    const r=_commit.apply(this,arguments);
+    try{
+      if(r && !r.cft && !r.closed && S.herdarCFT!==false && /^(line|pline|spline|arc)$/.test(r.type||'') && r.pts && r.pts.length>=2){
+        const c=cftAt(_mid(r.pts));
+        if(c){ r.cft=c; if(typeof cftColor==='function') r.color=cftColor(c); r._herdado=true; _refreshSoon(); }
+      }
+    }catch(_){}
+    return r;
+  };
+
+  function herdarToggle(){
+    S.herdarCFT = (S.herdarCFT===false);
+    try{ localStorage.setItem('linhaspro_herdarcft', S.herdarCFT?'1':'0'); }catch(_){}
+    if(typeof log==='function') log('Herança de classificação pelo contorno: '+(S.herdarCFT?'LIGADA':'DESLIGADA')+'. Linha nova dentro de um talhão classificado '+(S.herdarCFT?'passa a herdar':'não herda mais')+' a classificação.','g');
+  }
+  try{ if(typeof ALIASES!=='undefined'){ ALIASES['HERDAR']='HERDAR'; ALIASES['HERANCA']='HERDAR'; ALIASES['HERANÇA']='HERDAR'; } }catch(_){}
+  try{ if(typeof CMD_DESC!=='undefined') CMD_DESC.HERDAR='Liga/desliga a herança de classificação pelo contorno (linha nova herda o talhão)'; }catch(_){}
+  if(typeof startTool==='function'){ const _st=startTool; startTool=function(c){ if(c==='HERDAR'){ try{ if(typeof LAST_CMD!=='undefined') LAST_CMD=c; }catch(_){} if(typeof tool!=='undefined'&&tool.reset) tool.reset(); herdarToggle(); return; } return _st.apply(this,arguments); }; }
+})();
 
 </script>
 </body>
