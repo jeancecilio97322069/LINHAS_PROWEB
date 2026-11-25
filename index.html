@@ -2650,7 +2650,10 @@ function getOrCreateLayer(layerName, colorHex){
 
 // Importador DWG / DXF
 function importDWG_DXF(){
-  openFile('.dxf,.dwg', f => {
+  // No Android/iOS a extensão .dwg/.dxf é mapeada p/ MIME de imagem (image/vnd.dwg),
+  // o que faz o seletor abrir a GALERIA. Em celular usamos */* p/ abrir a pasta de Arquivos.
+  const _mobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent||'');
+  openFile(_mobile ? '*/*' : '.dxf,.dwg', f => {
     const name = f.name.toLowerCase();
     const rd = new FileReader();
 
