@@ -2733,6 +2733,7 @@ function processDXFString(dxfContent){
           layerName: ent.layer,
           color: ent.color,
           z: ent.z,
+          agk: ent.agk,
           ptsLL: ringLL
         });
       });
@@ -2743,7 +2744,7 @@ function processDXFString(dxfContent){
         S.cosLat0 = Math.cos(S.lat0 * Math.PI / 180);
       }
 
-      let countImported = 0;
+      let countImported = 0, cftCount = 0;
       const _lote=[], _layCache=new Map();
       entitiesLL.forEach(ent => {
         const localPts = ent.ptsLL.map(ll => fromLatLon(ll[0], ll[1]));
@@ -2751,14 +2752,29 @@ function processDXFString(dxfContent){
         if(targetLayerId==null){ targetLayerId=getOrCreateLayer(ent.layerName, ent.color); _layCache.set(ent.layerName,targetLayerId); }
         const ne={ type: ent.type, pts: localPts, closed: ent.closed, layer: targetLayerId, color: ent.color || null };
         if(ent.type==='point' && ent.z) ne.meta={Z:+(+ent.z).toFixed(3)};
+        // classificação do AgroCAD (xdata AGKEXPORT): CLIENTE#FAZENDA#TALHAO#NN#TIPO
+        if(ent.agk){
+          const a=ent.agk.split('#');
+          if(a.length>=5 && a[0] && a[2]){
+            const tipo=(a[a.length-1]||'').toUpperCase();
+            if(tipo!=='XXX'){
+              ne.cft={c:a[0],f:a[1],t:a[2]};
+              if(tipo==='BEX'||tipo==='BIN'){ ne.closed=true; }      // limites viram polígono fechado
+              if(tipo==='BEX'){ ne.limExt=true; }                    // limite externo (perímetro do talhão)
+              if(tipo==='BIN'){ ne.limInt=true; }                    // limite interno (exclusão) — não é o perímetro
+              cftCount++;
+            }
+          }
+        }
         _lote.push(ne);
         countImported++;
       });
       if(typeof bulkAdd==='function') bulkAdd(_lote); else _lote.forEach(e=>commit(e));
 
+      if(cftCount && typeof cftSyncRegistry==='function'){ cftSyncRegistry(); S.cftView=true; if(typeof cftLegendOn!=='undefined') cftLegendOn=true; if(typeof cftRefresh==='function') cftRefresh(); }
       renderLayers();
       zoomExtents();
-      log(`DXF/DWG: ${countImported} geometrias carregadas em ${parsed.layers.length} camadas.`, 'g');
+      log(`DXF/DWG: ${countImported} geometrias em ${parsed.layers.length} camadas`+(cftCount?` · ${cftCount} já classificadas (AgroCAD)`:'')+'.', 'g');
       S.dirty = true;
     });
 
@@ -2813,8 +2829,11 @@ function parseDXF(content){
         let pts = [];
         let color = null;
         let x=0, y=0, z=0, x1=0, y1=0, x2=0, y2=0, cx=0, cy=0, radius=0, startAng=0, endAng=0;
+        let agk=null, _xapp=null;
 
         while((g = nextGroup()) && !(g.code === 0)){
+          if(g.code === 1001) _xapp = g.val;
+          if(g.code === 1000 && _xapp === 'AGKEXPORT') agk = g.val;
           if(g.code === 8) layer = g.val.toUpperCase();
           if(g.code === 62){
             const aci = Math.abs(parseInt(g.val, 10));
@@ -2855,10 +2874,10 @@ function parseDXF(content){
         if(entType === 'POINT'){
           if(isFinite(x)&&isFinite(y)) entities.push({ type:'point', pts:[[x, y]], layer, color, closed:false, z });
         } else if(entType === 'LINE'){
-          entities.push({ type:'line', pts:[[x1, y1], [x2, y2]], layer, color, closed:false });
+          entities.push({ type:'line', pts:[[x1, y1], [x2, y2]], layer, color, closed:false, agk });
         } else if(entType === 'LWPOLYLINE' || entType === 'POLYLINE' || entType === 'SPLINE'){
           if(pts.length >= 2){
-            entities.push({ type: entType==='SPLINE'?'spline':'pline', pts, layer, color, closed });
+            entities.push({ type: entType==='SPLINE'?'spline':'pline', pts, layer, color, closed, agk });
           }
         } else if(entType === 'CIRCLE' && radius > 0){
           const circPts = [];
@@ -4989,7 +5008,7 @@ function enc1252(str){ const out=[]; for(const ch of String(str)){ const c=ch.co
 const PRJ_WGS84='GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",SPHEROID["WGS_1984",6378137.0,298.257223563]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]]';
 /* records: [{parts, values:[...]}]  fields: [{name,type:'C'|'N',len,dec}] -> {shp,shx,dbf,prj,cpg} (WGS84, PolyLine) */
 function writeShp(records,fields,o){
-  o=o||{}; const encStr=o.cp1252?enc1252:(t=>ENC.encode(t));
+  o=o||{}; const encStr=o.cp1252?enc1252:(t=>ENC.encode(t)); const ST=o.poly?5:3;
   let x0=Infinity,y0=Infinity,x1=-Infinity,y1=-Infinity;
   const bodies=records.map(r=>{
     const parts=r.parts, np=parts.length, npt=parts.reduce((s,p)=>s+p.length,0);
@@ -4997,7 +5016,7 @@ function writeShp(records,fields,o){
     for(const p of parts) for(const q of p){ if(q[0]<bx0)bx0=q[0]; if(q[0]>bx1)bx1=q[0]; if(q[1]<by0)by0=q[1]; if(q[1]>by1)by1=q[1]; }
     x0=Math.min(x0,bx0);y0=Math.min(y0,by0);x1=Math.max(x1,bx1);y1=Math.max(y1,by1);
     const b=new DataView(new ArrayBuffer(44+np*4+npt*16));
-    b.setInt32(0,3,true); b.setFloat64(4,bx0,true);b.setFloat64(12,by0,true);b.setFloat64(20,bx1,true);b.setFloat64(28,by1,true);
+    b.setInt32(0,ST,true); b.setFloat64(4,bx0,true);b.setFloat64(12,by0,true);b.setFloat64(20,bx1,true);b.setFloat64(28,by1,true);
     b.setInt32(36,np,true); b.setInt32(40,npt,true);
     let k=0, pi=0; for(const p of parts){ b.setInt32(44+pi*4,k,true); pi++; k+=p.length; }
     let o=44+np*4; for(const p of parts) for(const q of p){ b.setFloat64(o,q[0],true); b.setFloat64(o+8,q[1],true); o+=16; }
@@ -5005,7 +5024,7 @@ function writeShp(records,fields,o){
   });
   if(!records.length){ x0=y0=x1=y1=0; }
   const hdr=(lenBytes)=>{ const h=new DataView(new ArrayBuffer(100));
-    h.setInt32(0,9994,false); h.setInt32(24,lenBytes/2,false); h.setInt32(28,1000,true); h.setInt32(32,3,true);
+    h.setInt32(0,9994,false); h.setInt32(24,lenBytes/2,false); h.setInt32(28,1000,true); h.setInt32(32,ST,true);
     h.setFloat64(36,x0,true);h.setFloat64(44,y0,true);h.setFloat64(52,x1,true);h.setFloat64(60,y1,true); return new Uint8Array(h.buffer); };
   const shpLen=100+bodies.reduce((s,b)=>s+8+b.length,0);
   const shp=new Uint8Array(shpLen), shx=new Uint8Array(100+8*bodies.length);
@@ -5459,20 +5478,43 @@ function trimbleDir(s,keep){
   for(const c of '\\/:*?"<>|') s=s.split(c).join("_");
   return s||"SEM_VALOR";
 }
+/* anel fechado + sentido horario (outer ring CW) para Polygon; pts em [lon,lat] */
+function _trimbleRing(p){
+  const r=p.map(q=>[q[0],q[1]]);
+  if(r.length && (r[0][0]!==r[r.length-1][0]||r[0][1]!==r[r.length-1][1])) r.push([r[0][0],r[0][1]]);
+  let a=0; for(let i=0;i<r.length-1;i++) a+=r[i][0]*r[i+1][1]-r[i+1][0]*r[i][1];
+  if(a>0) r.reverse();   // >0 = anti-horario -> inverte
+  return r;
+}
+/* area do anel em m2 (projecao local em torno do centroide; pts em [lon,lat]) */
+function _ringAreaM2(r){
+  if(r.length<4) return 0;
+  let lat0=0,lon0=0; for(const q of r){ lon0+=q[0]; lat0+=q[1]; } lat0/=r.length; lon0/=r.length;
+  const R=6378137, cl=Math.cos(lat0*Math.PI/180), D=Math.PI/180;
+  const xy=r.map(q=>[(q[0]-lon0)*D*R*cl,(q[1]-lat0)*D*R]);
+  let a=0; for(let i=0;i<xy.length-1;i++) a+=xy[i][0]*xy[i+1][1]-xy[i+1][0]*xy[i][1];
+  return Math.abs(a/2);
+}
 function writeTrimble(lines){
   const files=[], groups=new Map();
   for(const l of lines){ const kp=l.src==="trimble"; const k=[trimbleDir(l.client,kp),trimbleDir(l.farm,kp),trimbleDir(l.field,kp)].join("/"); if(!groups.has(k)) groups.set(k,[]); groups.get(k).push(l); }
   /* Formato conferido com export real do monitor (AgGPS/Data/Cliente/Fazenda/Talhao):
-     LineFeature.shp/.shx/.dbf/.prj (sem .cpg, dbf ANSI 1252), 1 feicao por linha,
-     Id 1517 igual em todas, Name, Length (m), Dist1/Dist2 = 0, pasta Executado vazia,
-     <lon>E<lat>N600H.pos com o 1o vertice da 1a linha (sinal negativo, letras fixas E/N). */
-  const fields=[{name:"Id",type:"N",len:11,dec:0},{name:"Name",type:"C",len:255,dec:0},
+     - Adaptaveis (curvas) -> LineFeature.shp (PolyLine) · Id 1517, Name "Line", Length (m), Dist1/Dist2=0
+     - Limite externo      -> Boundary.shp    (Polygon)  · Id 0, Name "LIMITE EXTERNO", Area (m2), Dist1/Dist2=0
+     dbf ANSI 1252 (sem .cpg), pasta Executado vazia, <lon>E<lat>N600H.pos com o 1o vertice. */
+  const lineFields=[{name:"Id",type:"N",len:11,dec:0},{name:"Name",type:"C",len:255,dec:0},
     {name:"Length",type:"N",len:18,dec:9},{name:"Dist1",type:"N",len:18,dec:9},{name:"Dist2",type:"N",len:18,dec:9}];
+  const boundFields=[{name:"Id",type:"N",len:11,dec:0},{name:"Name",type:"C",len:255,dec:0},
+    {name:"Area",type:"N",len:18,dec:9},{name:"Dist1",type:"N",len:18,dec:9},{name:"Dist2",type:"N",len:18,dec:9}];
   for(const [k,ls] of groups){
     const dir="AgGPS/Data/"+k+"/";
-    const recs=[];
-    for(const l of ls) for(const p of l.parts) recs.push({parts:[p],values:[1517,"Line",partLength(p),0,0]});
-    files.push(...shpFiles(dir+"LineFeature",writeShp(recs,fields,{cp1252:true,prj:PRJ_TRIMBLE})));
+    const lineRecs=[], boundRecs=[];
+    for(const l of ls){
+      if(l._perim){ for(const p of l.parts){ const ring=_trimbleRing(p); boundRecs.push({parts:[ring],values:[0,"LIMITE EXTERNO",_ringAreaM2(ring),0,0]}); } }
+      else { for(const p of l.parts) lineRecs.push({parts:[p],values:[1517,"Line",partLength(p),0,0]}); }
+    }
+    if(lineRecs.length) files.push(...shpFiles(dir+"LineFeature",writeShp(lineRecs,lineFields,{cp1252:true,prj:PRJ_TRIMBLE})));
+    if(boundRecs.length) files.push(...shpFiles(dir+"Boundary",writeShp(boundRecs,boundFields,{cp1252:true,prj:PRJ_TRIMBLE,poly:true})));
     files.push({name:dir+"Executado/",data:new Uint8Array(0)});
     const q=ls[0].parts[0][0];
     files.push({name:dir+q[0].toFixed(5)+"E"+q[1].toFixed(5)+"N600H.pos",data:new Uint8Array(0)});
@@ -5983,7 +6025,9 @@ function cftStats(){
   for(const e of cftLineEnts()){
     const v=cftEntPts(e).length;
     if(!e.cft){ un.n++; un.v+=v; continue; }
-    const k=cftKey(e.cft); if(!m.has(k)) m.set(k,{o:e.cft,n:0,v:0}); const r=m.get(k); r.n++; r.v+=v;
+    const k=cftKey(e.cft); if(!m.has(k)) m.set(k,{o:e.cft,n:0,v:0,nAda:0,nLim:0,nInt:0}); const r=m.get(k); r.n++; r.v+=v;
+    const perim=!!(e.limExt||(e.closed&&!e.limInt));
+    if(e.limInt) r.nInt++; else if(perim) r.nLim++; else r.nAda++;
   }
   return {rows:[...m.values()].sort((a,b)=>cftLabel(a.o).localeCompare(cftLabel(b.o),'pt-BR',{numeric:true})),un};
 }
@@ -6010,11 +6054,12 @@ function cftRefresh(){
 function cftModelLines(filterKeys){
   const out=[]; const cnt=new Map();
   for(const e of cftLineEnts()){
-    if(!e.cft) continue; const k=cftKey(e.cft); if(filterKeys && !filterKeys.has(k)) continue;
+    if(!e.cft) continue; if(e.limInt) continue; const k=cftKey(e.cft); if(filterKeys && !filterKeys.has(k)) continue;
     const n=(cnt.get(k)||0)+1; cnt.set(k,n);
+    const perim=!!(e.limExt||(e.closed&&!e.limInt));
     const part=cftEntPts(e).map(p=>{ const ll=toLatLon(p[0],p[1]); return [ll[1],ll[0]]; });
-    if(e.closed) part.push(part[0].slice());
-    out.push({client:e.cft.c,farm:e.cft.f,field:e.cft.t,name:'CURVA '+n,base:'CURVA',parts:[part],src:'cad',_perim:!!e.closed});
+    if(perim) part.push(part[0].slice());
+    out.push({client:e.cft.c,farm:e.cft.f,field:e.cft.t,name:'CURVA '+n,base:'CURVA',parts:[part],src:'cad',_perim:perim});
   }
   return out;
 }
@@ -6029,7 +6074,7 @@ function cftExportDialog(){
   st.rows.forEach(r=>{ if(!byC.has(r.o.c)) byC.set(r.o.c,[]); byC.get(r.o.c).push(r); });
   for(const [c,rs] of byC){
     tree+=`<div class="ex-c"><label><input type="checkbox" class="exc" data-c="${cftEsc(c)}" checked> <b>${cftEsc(c)}</b></label>`;
-    rs.forEach(r=>{ tree+=`<label class="ex-t"><input type="checkbox" class="ext" data-k="${cftEsc(cftKey(r.o))}" data-c="${cftEsc(c)}" checked><i style="background:${cftColor(r.o)}"></i>${cftEsc(r.o.f)} | ${cftEsc(r.o.t)} <small>· Adaptáveis (${r.n})</small></label>`; });
+    rs.forEach(r=>{ tree+=`<label class="ex-t"><input type="checkbox" class="ext" data-k="${cftEsc(cftKey(r.o))}" data-c="${cftEsc(c)}" checked><i style="background:${cftColor(r.o)}"></i>${cftEsc(r.o.f)} | ${cftEsc(r.o.t)} <small>· Adaptáveis (${r.nAda})${r.nLim?` · Limite externo (${r.nLim})`:''}${r.nInt?` · Limite interno (${r.nInt}, fora)`:''}</small></label>`; });
     tree+='</div>';
   }
   modalHTML(`
@@ -7547,7 +7592,7 @@ mbApplyMode();
 /* ===================== IMPORTAR DWG → converte para DXF (padrão do Linhas Pro) → importa =====================
    Leitura do DWG: LibreDWG (WebAssembly, GPL-3) carregada só quando você abre um DWG, direto do CDN jsDelivr.
    Depois da 1ª vez fica guardada no navegador (IndexedDB) e funciona offline. */
-const DWG_LIB={ ver:'0.8.2', base:'https://cdn.jsdelivr.net/npm/@mlightcad/libredwg-web@0.8.2/' };
+const DWG_LIB={ ver:'0.9.4', base:'https://cdn.jsdelivr.net/npm/@mlightcad/libredwg-web@0.9.4/' };
 function _dwgIDB(){ return new Promise((res,rej)=>{ const r=indexedDB.open('cad_libredwg',1); r.onupgradeneeded=()=>r.result.createObjectStore('f'); r.onsuccess=()=>res(r.result); r.onerror=()=>rej(r.error); }); }
 async function _dwgGet(k){ try{ const db=await _dwgIDB(); return await new Promise(res=>{ const q=db.transaction('f').objectStore('f').get(k); q.onsuccess=()=>res(q.result||null); q.onerror=()=>res(null); }); }catch(_){ return null; } }
 async function _dwgPut(k,v){ try{ const db=await _dwgIDB(); await new Promise(res=>{ const t=db.transaction('f','readwrite'); t.objectStore('f').put(v,k); t.oncomplete=res; t.onerror=res; }); }catch(_){} }
@@ -7571,8 +7616,9 @@ function dwgToDXF(db){
   const scl=T=>Math.sqrt(Math.abs(T[0]*T[3]-T[1]*T[2]))||1;
   const colOf=(e,inh)=>{ const ci=e.colorIndex; if(ci===0) return inh.color; if(ci===256||ci==null) return (e.layer==='0'&&inh.layer)?inh.color:256; return ci; };
   const layOf=(e,inh)=>(e.layer==='0'&&inh.layer)?inh.layer:(e.layer||'0');
-  const polys=[], ptsOut=[]; let curIns=null;
-  const emitPoly=(pts,closed,lay,col,kind)=>{ if(pts.length<2) return; polys.push({pts,closed,lay,col,kind,ins:curIns}); };
+  const polys=[], ptsOut=[]; let curIns=null, curAgk=null;
+  const _agkOf=e=>{ if(!e||!e.xdata) return null; const g=e.xdata.find(x=>x&&x.appName==='AGKEXPORT'); if(!g||!g.value) return null; const v=g.value.find(c=>c&&c.code===1000&&typeof c.value==='string'&&c.value.indexOf('#')>=0); return v?v.value:null; };
+  const emitPoly=(pts,closed,lay,col,kind)=>{ if(pts.length<2) return; polys.push({pts,closed,lay,col,kind,ins:curIns,agk:curAgk}); };
   const arcPts=(T,cx,cy,r,a0,a1,ccw)=>{ // tessela por tolerância de corda (~1 cm na escala do desenho)
     let sw=a1-a0; if(ccw){ while(sw<=0) sw+=Math.PI*2; } const R=r*scl(T);
     const tol=Math.max(R*1e-4,0.01), da=2*Math.acos(Math.max(-1,Math.min(1,1-tol/Math.max(R,1e-9))))||0.1;
@@ -7603,6 +7649,7 @@ function dwgToDXF(db){
         0.5*((2*p1[1])+(-p0[1]+p2[1])*t+(2*p0[1]-5*p1[1]+4*p2[1]-p3[1])*t2+(-p0[1]+3*p1[1]-3*p2[1]+p3[1])*t3)]); } } P.push(pts[pts.length-1]); return P; };
   function emit(e,T,inh,depth){
     if(e.isVisible===false) return;
+    curAgk=_agkOf(e);
     const lay=layOf(e,inh), col=colOf(e,inh);
     switch(e.type){
       case 'LINE': emitPoly([ap(T,e.startPoint.x,e.startPoint.y),ap(T,e.endPoint.x,e.endPoint.y)],false,lay,col,'LINE'); break;
@@ -7651,7 +7698,7 @@ function dwgToDXF(db){
     const bad=new Set(); for(const p of polys){ if(!p.ins) continue; const b=bbOf(p.pts); if(b[0]<B[0]-m||b[2]>B[2]+m||b[1]<B[1]-m||b[3]>B[3]+m) bad.add(p.ins); }
     if(bad.size){ keep=polys.filter(p=>!bad.has(p.ins)); st.skip['bloco fora da área (escala suspeita)']=bad.size; st.ins-=bad.size; } }
   for(const p of keep){ used.add(p.lay); W(0,'LWPOLYLINE'); W(8,p.lay); if(p.col!==256&&p.col!=null) W(62,p.col); W(90,p.pts.length); W(70,p.closed?1:0);
-    for(const q of p.pts){ W(10,f(q[0])); W(20,f(q[1])); } st.ents++; st.by[p.kind]=(st.by[p.kind]||0)+1; }
+    for(const q of p.pts){ W(10,f(q[0])); W(20,f(q[1])); } if(p.agk){ W(1001,'AGKEXPORT'); W(1000,p.agk); } st.ents++; st.by[p.kind]=(st.by[p.kind]||0)+1; }
   for(const q of ptsOut){ used.add(q.lay); W(0,'POINT'); W(8,q.lay); if(q.col!==256&&q.col!=null) W(62,q.col); W(10,f(q.p[0])); W(20,f(q.p[1])); W(30,f(q.z)); st.ents++; st.by.POINT=(st.by.POINT||0)+1; }
   tgt=out; const L2=layers.filter(l=>used.has(l.name));
   W(0,'SECTION'); W(2,'TABLES'); W(0,'TABLE'); W(2,'LAYER'); W(70,L2.length);
@@ -12353,6 +12400,57 @@ if(typeof CMD_DESC!=='undefined') CMD_DESC.EXPMAPA='Exportar mapa do projeto com
   try{ if(typeof ALIASES!=='undefined'){ ALIASES['HERDAR']='HERDAR'; ALIASES['HERANCA']='HERDAR'; ALIASES['HERANÇA']='HERDAR'; } }catch(_){}
   try{ if(typeof CMD_DESC!=='undefined') CMD_DESC.HERDAR='Liga/desliga a herança de classificação pelo contorno (linha nova herda o talhão)'; }catch(_){}
   if(typeof startTool==='function'){ const _st=startTool; startTool=function(c){ if(c==='HERDAR'){ try{ if(typeof LAST_CMD!=='undefined') LAST_CMD=c; }catch(_){} if(typeof tool!=='undefined'&&tool.reset) tool.reset(); herdarToggle(); return; } return _st.apply(this,arguments); }; }
+})();
+
+/* ===================== BOTÃO LIMITE EXTERNO (LIMEXT) =====================
+   Marca os polígonos selecionados como LIMITE EXTERNO do talhão: fecha o
+   polígono e marca o papel (limExt). Na exportação p/ monitor esses viram
+   LIMITE EXTERNO (perímetro). Sem seleção, age em todos os polígonos
+   fechados. Rodar de novo na mesma seleção desmarca (toggle).
+   Obs.: para exportar, o limite precisa estar classificado (Cliente/
+   Fazenda/Talhão) — se não estiver, o comando avisa.                     */
+(function(){
+  if(typeof ents==='undefined' || typeof commit!=='function') return;
+
+  function limExtRun(){
+    const sel = (typeof selection!=='undefined') ? ents.filter(e=>selection.has(e.id)) : [];
+    const isPoly = e => e.pts && e.pts.length>=3 && (e.type==='pline'||e.type==='spline'||e.type==='line'||e.type==='arc');
+    let targets = (sel.length ? sel : ents.filter(e=>e.closed)).filter(isPoly);
+    if(!targets.length){ if(typeof log==='function') log('Selecione os polígonos (ou tenha polígonos fechados) para marcar como limite externo.','e'); return; }
+    pushState();
+    const allOn = targets.every(e=>e.limExt);
+    let n=0, noCft=0;
+    for(const e of targets){
+      if(allOn){ e.limExt=false; }
+      else { e.limExt=true; e.limInt=false; e.closed=true; if(!e.cft) noCft++; }
+      n++;
+    }
+    if(typeof cftSyncRegistry==='function') cftSyncRegistry();
+    if(typeof renderLayers==='function') renderLayers();
+    if(typeof render==='function') render();
+    S.dirty=true;
+    if(typeof log==='function'){
+      if(allOn) log(`${n} polígono(s) desmarcado(s) como limite externo.`,'g');
+      else log(`${n} polígono(s) marcado(s) como LIMITE EXTERNO`+(noCft?` · ${noCft} ainda sem classificação (use Classificar p/ exportar)`:'')+'.','g');
+    }
+  }
+  window.limExtRun=limExtRun;
+
+  // comando por linha / alias
+  try{ if(typeof ALIASES!=='undefined'){ ALIASES['LIMEXT']='LIMEXT'; ALIASES['LIMITEEXTERNO']='LIMEXT'; ALIASES['BEX']='LIMEXT'; } }catch(_){}
+  try{ if(typeof CMD_DESC!=='undefined') CMD_DESC.LIMEXT='Marca os polígonos selecionados como limite externo do talhão (toggle)'; }catch(_){}
+  if(typeof startTool==='function'){ const _st=startTool; startTool=function(c){ if(c==='LIMEXT'){ try{ if(typeof LAST_CMD!=='undefined') LAST_CMD=c; }catch(_){} if(typeof tool!=='undefined'&&tool.reset) tool.reset(); limExtRun(); return; } return _st.apply(this,arguments); }; }
+
+  // botão no painel Classificação, logo após "Pelo contorno" (CLA)
+  function addButton(){
+    try{
+      const cla=document.querySelector('.rb[data-cmd="CLA"]'); if(!cla || document.querySelector('.rb[data-cmd="LIMEXT"]')) return;
+      const html='<div class="rb lg" data-cmd="LIMEXT" title="Limite externo (LIMEXT) — marca os polígonos selecionados como limite externo do talhão" style="--ic:#ffa63a"><svg viewBox="0 0 24 24" width="26" height="26"><path d="M4 6l8-3 8 3v12l-8 3-8-3z"/><path d="M8 12l2.5 2.5L16 9" class="a"/></svg><span>Limite externo</span></div>';
+      cla.insertAdjacentHTML('afterend', html);
+      const btn=cla.nextElementSibling; if(btn) btn.onclick=()=>{ try{ startTool('LIMEXT'); }catch(_){ limExtRun(); } };
+    }catch(_){}
+  }
+  if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',addButton); else addButton();
 })();
 
 </script>
